@@ -4,11 +4,18 @@
 // mainnet peers over AppRequest and verified as merkle range proofs against
 // S's root by the reused coreth sync client. No node runs anywhere.
 //
+// Two phases: phase 1 walks only the account trie (fast; finishes while S
+// is minutes old) writing 0x07 rows plus a 0x09 pending-storage queue row
+// per contract; phase 2 drains the queue (0x08 slot rows, queue row deleted
+// as the completion marker). Serving cost on peers grows with S age because
+// diverged snapshot ranges fall back to trie iteration, so the storage
+// fetches must start early, not after an hour of inline mixing.
+//
 // Resumable: the account keyspace is split into 256 segments by first hash
 // byte; a done-bitmap rides the baseline progress row and per-segment
-// watermarks are recovered from the greatest committed 0x07 key. Per account,
-// storage and (first-claim) code rows are enqueued before the account row,
-// so a committed account row implies its state is complete; code gaps from
+// watermarks are recovered from the greatest committed 0x07 key. A committed
+// account row implies its 0x09 row (queued before it); a deleted 0x09 row
+// implies complete storage (deleted after the slot rows); code gaps from
 // cross-worker claim races are closed by a final code sweep.
 package sync
 
@@ -54,8 +61,8 @@ type Config struct {
 
 const leafLimit = 1024 // server-side response cap
 
-// storageConcurrency is how many storage tries one segment worker resolves
-// in parallel within an account response (storage requests dominate).
+// storageConcurrency bounds per-response concurrency in phase 1 (code
+// fetches only; storage is deferred to phase 2).
 const storageConcurrency = 6
 
 // Giant storage tries dominate the load's tail: after splitAfter sequential
@@ -73,6 +80,9 @@ type bundle struct {
 	seg   int
 	final bool
 	apply func(bl *store.Baseline) error
+	// barrier, when non-nil, makes the writer flush the Baseline and
+	// report; phase 2 scans committed rows, so it must fence phase 1.
+	barrier chan error
 }
 
 type syncer struct {
@@ -151,6 +161,9 @@ func Run(ctx context.Context, cfg Config) error {
 				bitmap[b.seg/8] |= 1 << (b.seg % 8)
 				bl.SetProgress(bitmap[:])
 			}
+			if b.barrier != nil {
+				b.barrier <- bl.Flush()
+			}
 		}
 		writerErr <- nil
 	}()
@@ -178,12 +191,25 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
+	// Phase 1: account leaves only (plus first-claim code); storage roots
+	// land in the 0x09 queue. Keeping this phase free of storage fetches
+	// finishes it while S is minutes old; phase 2 then hits peers whose
+	// snapshots still mostly match S (divergence grows per block, and
+	// diverged ranges are served by slow trie iteration).
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(cfg.Workers)
 	for _, t := range tasks {
 		g.Go(func() error { return s.runSegment(gctx, t.seg, t.start) })
 	}
 	segErr := g.Wait()
+
+	// Phase 2: drain the storage queue with the same worker budget.
+	if segErr == nil {
+		cfg.Log.Info("phase 1 done: account trie walked", "accounts", s.accounts.Load(),
+			"elapsed", time.Since(t0).Round(time.Second).String())
+		segErr = s.drainStorageQueue(ctx)
+	}
+
 	close(s.writes)
 	werr := <-writerErr
 	close(statusDone)
@@ -194,7 +220,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return werr
 	}
 
-	if err := bl.Flush(); err != nil { // make all segment-final bits durable
+	if err := bl.Flush(); err != nil { // pending queue deletions and bits
 		return err
 	}
 	if err := s.codeSweep(ctx, bl); err != nil {
@@ -206,6 +232,71 @@ func Run(ctx context.Context, cfg Config) error {
 	cfg.Log.Info("baseline sync complete", "accounts", s.accounts.Load(), "slots", s.slots.Load(),
 		"codes", s.codes.Load(), "elapsed", time.Since(t0).Round(time.Second).String())
 	return nil
+}
+
+// drainStorageQueue is phase 2: fetch every queued storage trie, write its
+// 0x08 rows, and delete the queue row as the completion marker (ordered
+// after the slot rows through the shared writer, so a missing queue row
+// implies complete storage).
+func (s *syncer) drainStorageQueue(ctx context.Context) error {
+	// Fence: every phase-1 row (0x07 and 0x09) must be committed before the
+	// queue scan below can see it.
+	barrier := make(chan error, 1)
+	if err := s.enqueue(ctx, bundle{seg: -1, barrier: barrier}); err != nil {
+		return err
+	}
+	select {
+	case err := <-barrier:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	const scanBatch = 4096
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.cfg.Workers)
+	var after []byte
+	var queued uint64
+	for {
+		addrs, roots, err := s.cfg.DB.StorageQueueAfter(after, scanBatch)
+		if err != nil {
+			return err
+		}
+		if len(addrs) == 0 {
+			break
+		}
+		for i := range addrs {
+			addrHash, root := addrs[i], roots[i]
+			queued++
+			g.Go(func() error {
+				next, err := s.walkStorage(gctx, -1, addrHash, common.Hash(root), nil, nil, splitAfter)
+				if err != nil {
+					return err
+				}
+				if next != nil { // giant: fan out the rest of the keyspace
+					sg, sgctx := errgroup.WithContext(gctx)
+					for _, r := range splitRange(next, splitWays) {
+						sg.Go(func() error {
+							_, err := s.walkStorage(sgctx, -1, addrHash, common.Hash(root), r[0], r[1], 0)
+							return err
+						})
+					}
+					if err := sg.Wait(); err != nil {
+						return err
+					}
+				}
+				return s.enqueue(gctx, bundle{seg: -1, apply: func(bl *store.Baseline) error {
+					return bl.DequeueStorage(addrHash)
+				}})
+			})
+		}
+		last := addrs[len(addrs)-1]
+		after = last[:]
+	}
+	s.cfg.Log.Info("phase 2: storage queue scanned", "tries", queued)
+	return g.Wait()
 }
 
 // runSegment walks one 1/256th of the account trie.
@@ -290,28 +381,10 @@ func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) (f
 		row.Balance = *acc.Balance
 	}
 
-	// Storage trie: sequential first; a trie still going after splitAfter
-	// responses is giant, so the rest of its keyspace fans out into
-	// splitWays parallel sub-ranges (slot bundles are order-independent;
-	// the account row below is returned only after all of them finish).
-	if acc.Root != (common.Hash{}) && acc.Root != types.EmptyRootHash {
-		next, err := s.walkStorage(ctx, seg, addrHash, acc.Root, nil, nil, splitAfter)
-		if err != nil {
-			return nil, err
-		}
-		if next != nil {
-			sg, sgctx := errgroup.WithContext(ctx)
-			for _, r := range splitRange(next, splitWays) {
-				sg.Go(func() error {
-					_, err := s.walkStorage(sgctx, seg, addrHash, acc.Root, r[0], r[1], 0)
-					return err
-				})
-			}
-			if err := sg.Wait(); err != nil {
-				return nil, err
-			}
-		}
-	}
+	// Storage is NOT fetched here (phase 1 must finish while S is fresh);
+	// the account's storage root goes into the 0x09 queue for phase 2,
+	// ordered before the account row below.
+	hasStorage := acc.Root != (common.Hash{}) && acc.Root != types.EmptyRootHash
 
 	// Code: first claimer fetches; races are closed by the final sweep.
 	var code []byte
@@ -328,9 +401,15 @@ func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) (f
 	}
 
 	s.accounts.Add(1)
+	storageRoot := schema.Hash(acc.Root)
 	return func(bl *store.Baseline) error {
 		if code != nil {
 			if err := bl.Code(schema.Hash(codeHash), code); err != nil {
+				return err
+			}
+		}
+		if hasStorage {
+			if err := bl.QueueStorage(addrHash, storageRoot); err != nil {
 				return err
 			}
 		}

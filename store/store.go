@@ -238,9 +238,13 @@ const baselineChunk = 1 << 16 // rows per write txn; chunked so block capture tx
 type Baseline struct {
 	d        *DB
 	s        uint64
-	keys     [][]byte
-	vals     [][]byte
+	ops      []blOp
 	progress []byte // written with the next flush txn, then cleared
+}
+
+type blOp struct {
+	k, v []byte
+	del  bool
 }
 
 // NewBaseline starts the baseline at S and records the history genesis meta
@@ -263,9 +267,16 @@ func (d *DB) NewBaseline(s uint64) (*Baseline, error) {
 }
 
 func (bl *Baseline) add(k, v []byte) error {
-	bl.keys = append(bl.keys, k)
-	bl.vals = append(bl.vals, v)
-	if len(bl.keys) >= baselineChunk {
+	bl.ops = append(bl.ops, blOp{k: k, v: v})
+	if len(bl.ops) >= baselineChunk {
+		return bl.Flush()
+	}
+	return nil
+}
+
+func (bl *Baseline) addDel(k []byte) error {
+	bl.ops = append(bl.ops, blOp{k: k, del: true})
+	if len(bl.ops) >= baselineChunk {
 		return bl.Flush()
 	}
 	return nil
@@ -296,10 +307,10 @@ func (d *DB) BaselineProgress() ([]byte, bool, error) {
 	return p, ok, err
 }
 
-// Flush commits the buffered rows (and any pending progress cursor) in one
-// write txn.
+// Flush commits the buffered ops (and any pending progress cursor) in one
+// write txn, preserving buffer order.
 func (bl *Baseline) Flush() error {
-	if len(bl.keys) == 0 && bl.progress == nil {
+	if len(bl.ops) == 0 && bl.progress == nil {
 		return nil
 	}
 	err := bl.d.env.Update(func(txn *lmdb.Txn) error {
@@ -308,8 +319,15 @@ func (bl *Baseline) Flush() error {
 			return err
 		}
 		defer cur.Close()
-		for i := range bl.keys {
-			if err := cur.Put(bl.keys[i], bl.vals[i], 0); err != nil {
+		for i := range bl.ops {
+			op := &bl.ops[i]
+			if op.del {
+				if err := txn.Del(bl.d.dbi, op.k, nil); err != nil && !lmdb.IsNotFound(err) {
+					return err
+				}
+				continue
+			}
+			if err := cur.Put(op.k, op.v, 0); err != nil {
 				return err
 			}
 		}
@@ -318,8 +336,7 @@ func (bl *Baseline) Flush() error {
 		}
 		return nil
 	})
-	bl.keys = bl.keys[:0]
-	bl.vals = bl.vals[:0]
+	bl.ops = bl.ops[:0]
 	if err == nil {
 		bl.progress = nil
 	}
@@ -349,6 +366,19 @@ func (bl *Baseline) BaseSlot(addrHash, slotHash, val schema.Hash) error {
 	return bl.add(schema.AppendBaseSlotKey(nil, addrHash, slotHash), val[:])
 }
 
+// QueueStorage buffers one 0x09 pending-storage row (loader phase 1). Add it
+// in the same bundle as, and before, the account row: a committed account row
+// then implies its queue row is durable.
+func (bl *Baseline) QueueStorage(addrHash, root schema.Hash) error {
+	return bl.add(schema.AppendStorageQueueKey(nil, addrHash), root[:])
+}
+
+// DequeueStorage buffers the deletion of a 0x09 row (loader phase 2
+// completion marker); order it after the trie's last slot row.
+func (bl *Baseline) DequeueStorage(addrHash schema.Hash) error {
+	return bl.addDel(schema.AppendStorageQueueKey(nil, addrHash))
+}
+
 // --- hash-keyed baseline rows (D6 rev 2, 0x07/0x08) ---
 //
 // The snapshot baseline at S is keyed by keccak(addr)/keccak(slot) because no
@@ -373,13 +403,27 @@ func (d *DB) PutBaseSlot(addrHash, slotHash schema.Hash, val schema.Hash) error 
 }
 
 // Finish flushes, clears the loader progress cursor, and sets the
-// baseline_complete watermark.
+// baseline_complete watermark. It refuses (D13) while any pending-storage
+// queue row remains: completing with unfetched storage would serve wrong
+// zeros forever.
 func (bl *Baseline) Finish() error {
 	bl.progress = nil
 	if err := bl.Flush(); err != nil {
 		return err
 	}
 	err := bl.d.env.Update(func(txn *lmdb.Txn) error {
+		cur, err := txn.OpenCursor(bl.d.dbi)
+		if err != nil {
+			return err
+		}
+		k, _, err := cur.Get([]byte{schema.PrefStorageQueue}, nil, lmdb.SetRange)
+		cur.Close()
+		if err == nil && len(k) > 0 && k[0] == schema.PrefStorageQueue {
+			return fmt.Errorf("store: baseline finish with pending storage queue rows (first %x)", k)
+		}
+		if err != nil && !lmdb.IsNotFound(err) {
+			return err
+		}
 		if err := txn.Del(bl.d.dbi, schema.MetaBaselineProgress, nil); err != nil && !lmdb.IsNotFound(err) {
 			return err
 		}

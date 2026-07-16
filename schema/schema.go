@@ -23,6 +23,11 @@ const (
 	// after a preimage-history miss; one keccak, off the steady-state path.
 	PrefBaseAccount byte = 0x07 // 0x07 | keccak(addr)(32) -> account post-image at S
 	PrefBaseSlot    byte = 0x08 // 0x08 | keccak(addr)(32) | keccak(slot)(32) -> slot value at S
+	// PrefStorageQueue is the baseline loader's pending-storage work queue:
+	// 0x09 | keccak(addr)(32) -> storage root at S. Rows are written with the
+	// account rows in phase 1 and deleted as phase 2 completes each trie;
+	// the keyspace is empty in a complete baseline.
+	PrefStorageQueue byte = 0x09
 )
 
 // Meta keys (prefix 0x00).
@@ -145,4 +150,9 @@ func AppendBaseSlotKey(dst []byte, addrHash Hash, slotHash Hash) []byte {
 	dst = append(dst, PrefBaseSlot)
 	dst = append(dst, addrHash[:]...)
 	return append(dst, slotHash[:]...)
+}
+
+func AppendStorageQueueKey(dst []byte, addrHash Hash) []byte {
+	dst = append(dst, PrefStorageQueue)
+	return append(dst, addrHash[:]...)
 }

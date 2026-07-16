@@ -309,6 +309,43 @@ func (d *DB) MaxBaseSlot(addrHash schema.Hash, start, end []byte) (h schema.Hash
 	return
 }
 
+// StorageQueueAfter returns up to max pending-storage queue entries with
+// account hash strictly greater than after (nil = from the beginning).
+// Phase-2 scan cursor for the loader.
+func (d *DB) StorageQueueAfter(after []byte, max int) (addrs, roots []schema.Hash, err error) {
+	err = d.env.View(func(txn *lmdb.Txn) error {
+		txn.RawRead = true
+		cur, err := txn.OpenCursor(d.dbi)
+		if err != nil {
+			return err
+		}
+		defer cur.Close()
+		seek := []byte{schema.PrefStorageQueue}
+		if after != nil {
+			seek = append(schema.AppendStorageQueueKey(nil, schema.Hash(after)), 0)
+		}
+		k, v, err := cur.Get(seek, nil, lmdb.SetRange)
+		for ; err == nil; k, v, err = cur.Get(nil, nil, lmdb.Next) {
+			if len(k) != 33 || k[0] != schema.PrefStorageQueue {
+				break
+			}
+			if len(v) != 32 {
+				return fmt.Errorf("store: storage queue row %x has %d-byte value", k, len(v))
+			}
+			addrs = append(addrs, schema.Hash(k[1:33]))
+			roots = append(roots, schema.Hash(v))
+			if len(addrs) >= max {
+				return nil
+			}
+		}
+		if err != nil && !lmdb.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+	return
+}
+
 // MissingCodeHashes scans the 0x07 baseline accounts and returns the unique
 // referenced code hashes that have no 0x06 row yet (loader code sweep).
 // One long read txn; run it only while the writer is quiet.

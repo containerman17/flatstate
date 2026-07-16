@@ -58,3 +58,23 @@ Wire facts (verified in v1.14.2 source):
   then need FFI revision iteration is strictly more code.
 - **eth_getProof / RPC scraping**: no range enumeration, per-key only; unusable for
   ~10^8 keys and adds a second trust model.
+
+## Rev 3 addendum: two-phase load (learned live, 2026-07-16)
+
+- Peers serve a leafs request by optimistic read from their CURRENT snapshot,
+  validated against the requested root; diverged ranges fall back to slow raw trie
+  iteration with partial responses, and the whole root disappears when head crosses
+  the next summary boundary. Both costs grow with the AGE of S, and giant active
+  contracts diverge within minutes. An inline account+storage walk starves: every
+  segment blocks on its first giant while S ages (measured: 18% account coverage
+  after an hour, then decay).
+- Therefore two phases: phase 1 walks only account leaves (minutes) and queues each
+  contract's storage root under 0x09 (committed before its account row); phase 2
+  drains the queue while S is still fresh, deleting each 0x09 row after its slot rows
+  as the completion marker. Finish() refuses while any 0x09 row remains.
+- Peer discipline (all measured live): global in-flight cap (default 1536), per-peer
+  cap (4-6), 3 min cooldown for peers that time out or answer AppError, random spread
+  over every connected peer instead of PeerTracker.SelectPeer (which funnels
+  concurrent callers onto a handful of peers). Multiple p2p identities exist
+  (-identities) but did not move the needle: the limit is server-side serve cost,
+  not per-node throttling.
