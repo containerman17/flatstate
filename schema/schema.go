@@ -30,6 +30,7 @@ var (
 	MetaGenesis          = []byte{PrefMeta, 0x01} // history genesis S (8 bytes BE)
 	MetaBaselineComplete = []byte{PrefMeta, 0x02} // presence = baseline complete
 	MetaFinalized        = []byte{PrefMeta, 0x03} // finalized height (8 bytes BE)
+	MetaBaselineProgress = []byte{PrefMeta, 0x04} // opaque loader resume cursor; deleted by Finish
 )
 
 // Key lengths.

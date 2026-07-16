@@ -236,10 +236,11 @@ const baselineChunk = 1 << 16 // rows per write txn; chunked so block capture tx
 // (address, slot), then codes by hash) for sequential B+tree inserts; the
 // loader chunks commits so capture write txns for S+1... interleave.
 type Baseline struct {
-	d    *DB
-	s    uint64
-	keys [][]byte
-	vals [][]byte
+	d        *DB
+	s        uint64
+	keys     [][]byte
+	vals     [][]byte
+	progress []byte // written with the next flush txn, then cleared
 }
 
 // NewBaseline starts the baseline at S and records the history genesis meta
@@ -265,13 +266,40 @@ func (bl *Baseline) add(k, v []byte) error {
 	bl.keys = append(bl.keys, k)
 	bl.vals = append(bl.vals, v)
 	if len(bl.keys) >= baselineChunk {
-		return bl.flush()
+		return bl.Flush()
 	}
 	return nil
 }
 
-func (bl *Baseline) flush() error {
-	if len(bl.keys) == 0 {
+// SetProgress records an opaque loader resume cursor; it is committed in the
+// same txn as the next Flush, so it can never run ahead of the flushed rows.
+func (bl *Baseline) SetProgress(p []byte) {
+	bl.progress = bytes.Clone(p)
+}
+
+// BaselineProgress returns the loader resume cursor, if one was recorded.
+func (d *DB) BaselineProgress() ([]byte, bool, error) {
+	var p []byte
+	var ok bool
+	err := d.env.View(func(txn *lmdb.Txn) error {
+		v, err := txn.Get(d.dbi, schema.MetaBaselineProgress)
+		if lmdb.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		p = bytes.Clone(v)
+		ok = true
+		return nil
+	})
+	return p, ok, err
+}
+
+// Flush commits the buffered rows (and any pending progress cursor) in one
+// write txn.
+func (bl *Baseline) Flush() error {
+	if len(bl.keys) == 0 && bl.progress == nil {
 		return nil
 	}
 	err := bl.d.env.Update(func(txn *lmdb.Txn) error {
@@ -285,10 +313,16 @@ func (bl *Baseline) flush() error {
 				return err
 			}
 		}
+		if bl.progress != nil {
+			return txn.Put(bl.d.dbi, schema.MetaBaselineProgress, bl.progress, 0)
+		}
 		return nil
 	})
 	bl.keys = bl.keys[:0]
 	bl.vals = bl.vals[:0]
+	if err == nil {
+		bl.progress = nil
+	}
 	return err
 }
 
@@ -302,6 +336,17 @@ func (bl *Baseline) Slot(addr schema.Address, slot schema.Hash, val schema.Hash)
 
 func (bl *Baseline) Code(hash schema.Hash, code []byte) error {
 	return bl.add(schema.AppendCodeKey(nil, hash), bytes.Clone(code))
+}
+
+// BaseAccount buffers one 0x07 hash-keyed baseline account row (D6 rev 2);
+// the batched sibling of DB.PutBaseAccount for the bulk loader.
+func (bl *Baseline) BaseAccount(addrHash schema.Hash, a *schema.Account) error {
+	return bl.add(schema.AppendBaseAccountKey(nil, addrHash), schema.EncodeAccount(nil, a))
+}
+
+// BaseSlot buffers one 0x08 hash-keyed baseline slot row (D6 rev 2).
+func (bl *Baseline) BaseSlot(addrHash, slotHash, val schema.Hash) error {
+	return bl.add(schema.AppendBaseSlotKey(nil, addrHash, slotHash), val[:])
 }
 
 // --- hash-keyed baseline rows (D6 rev 2, 0x07/0x08) ---
@@ -327,12 +372,20 @@ func (d *DB) PutBaseSlot(addrHash, slotHash schema.Hash, val schema.Hash) error 
 	})
 }
 
-// Finish flushes and sets the baseline_complete watermark.
+// Finish flushes, clears the loader progress cursor, and sets the
+// baseline_complete watermark.
 func (bl *Baseline) Finish() error {
-	if err := bl.flush(); err != nil {
+	bl.progress = nil
+	if err := bl.Flush(); err != nil {
 		return err
 	}
-	if err := bl.d.putMeta(schema.MetaBaselineComplete, []byte{1}); err != nil {
+	err := bl.d.env.Update(func(txn *lmdb.Txn) error {
+		if err := txn.Del(bl.d.dbi, schema.MetaBaselineProgress, nil); err != nil && !lmdb.IsNotFound(err) {
+			return err
+		}
+		return txn.Put(bl.d.dbi, schema.MetaBaselineComplete, []byte{1}, 0)
+	})
+	if err != nil {
 		return err
 	}
 	bl.d.baselineDone.Store(true)

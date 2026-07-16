@@ -55,7 +55,7 @@ func buildHistory(t *testing.T, d *DB) {
 	}
 
 	// Baseline incomplete: an uncovered key must fail loud.
-	if err := bl.flush(); err != nil {
+	if err := bl.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := d.GetAccount(addrC, 100); !errors.Is(err, ErrBaselineIncomplete) {
