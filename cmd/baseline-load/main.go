@@ -59,7 +59,8 @@ func run() error {
 		mapGB    = flag.Int64("map-size-gb", 200, "LMDB map size in GiB")
 		nodeURI  = flag.String("node-uri", fnet.DefaultNodeURI, "public node for bootstrap RPC")
 		workers  = flag.Int("workers", 32, "concurrent leaf-range fetchers")
-		inflight = flag.Int("inflight", 320, "global cap on outstanding leaf/code requests")
+		inflight = flag.Int("inflight", 1536, "global cap on outstanding leaf/code requests")
+		perPeer  = flag.Int("per-peer", 6, "outstanding request cap per peer")
 		height   = flag.Uint64("height", 0, "pivot height S (0 = latest summary boundary)")
 	)
 	flag.Parse()
@@ -121,7 +122,7 @@ func run() error {
 		return fmt.Errorf("net: %w", err)
 	}
 	defer network.Close()
-	nc = fsync.NewNetClient(network, *inflight)
+	nc = fsync.NewNetClient(network, *inflight, *perPeer)
 
 	client := syncclient.New(&syncclient.Config{
 		Network: nc,

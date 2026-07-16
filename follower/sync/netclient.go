@@ -36,9 +36,10 @@ const badPeerCooldown = 3 * time.Minute
 // outstanding requests degenerate into timeout churn (measured live: the
 // giant-trie fan-out at ~4000 outstanding collapsed to <20 req/s).
 type NetClient struct {
-	net   *net.Network
-	reqID atomic.Uint32 // doubled for even IDs
-	sem   chan struct{}
+	net     *net.Network
+	reqID   atomic.Uint32 // doubled for even IDs
+	sem     chan struct{}
+	perPeer int
 
 	timeouts atomic.Uint64
 
@@ -50,11 +51,10 @@ type NetClient struct {
 	badUntil    map[ids.NodeID]time.Time
 }
 
-// perPeerCap bounds outstanding requests per peer: hundreds of concurrent
+// perPeer bounds outstanding requests per peer: hundreds of concurrent
 // callers through the tracker's SelectPeer all pile onto the few "best"
 // peers, which then throttle us (measured: 8x slowdown). Random spread over
 // every connected peer with a small per-peer cap keeps all of them busy.
-const perPeerCap = 4
 
 type appReply struct {
 	bytes  []byte
@@ -62,14 +62,19 @@ type appReply struct {
 }
 
 // NewNetClient wraps the network. Wire Callbacks.AppResponse to
-// OnAppResponse when dialing. inflight <= 0 defaults to 320.
-func NewNetClient(n *net.Network, inflight int) *NetClient {
+// OnAppResponse when dialing. inflight <= 0 defaults to 320; perPeer <= 0
+// defaults to 6.
+func NewNetClient(n *net.Network, inflight, perPeer int) *NetClient {
 	if inflight <= 0 {
 		inflight = 320
+	}
+	if perPeer <= 0 {
+		perPeer = 6
 	}
 	return &NetClient{
 		net:         n,
 		sem:         make(chan struct{}, inflight),
+		perPeer:     perPeer,
 		pending:     make(map[uint32]chan appReply),
 		outstanding: make(map[ids.NodeID]int),
 		badUntil:    make(map[ids.NodeID]time.Time),
@@ -121,7 +126,7 @@ func (c *NetClient) pickPeer() (ids.NodeID, bool) {
 	var haveFallback bool
 	for i := range peers {
 		id := peers[(off+i)%len(peers)]
-		if c.outstanding[id] >= perPeerCap {
+		if c.outstanding[id] >= c.perPeer {
 			continue
 		}
 		if now.Before(c.badUntil[id]) {
