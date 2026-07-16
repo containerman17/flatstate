@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/big"
 	gosync "sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +54,14 @@ const leafLimit = 1024 // server-side response cap
 // storageConcurrency is how many storage tries one segment worker resolves
 // in parallel within an account response (storage requests dominate).
 const storageConcurrency = 6
+
+// Giant storage tries dominate the load's tail: after splitAfter sequential
+// responses a trie is declared giant and the rest of its keyspace is fetched
+// as splitWays parallel sub-ranges. Vars so tests can shrink them.
+var (
+	splitAfter = 32
+	splitWays  = 16
+)
 
 type bundle struct {
 	seg   int
@@ -270,51 +279,25 @@ func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) (f
 		row.Balance = *acc.Balance
 	}
 
-	// Storage trie, slot bundles streamed as fetched.
-	// ponytail: one fetcher per storage trie; split giant tries into parallel
-	// sub-ranges if a profile shows a single-account tail dominating.
+	// Storage trie: sequential first; a trie still going after splitAfter
+	// responses is giant, so the rest of its keyspace fans out into
+	// splitWays parallel sub-ranges (slot bundles are order-independent;
+	// the account row below is returned only after all of them finish).
 	if acc.Root != (common.Hash{}) && acc.Root != types.EmptyRootHash {
-		var start []byte
-		for {
-			req, err := message.NewLeafsRequest(message.CorethLeafsRequestType,
-				acc.Root, common.Hash(addrHash), start, nil, leafLimit, message.StateTrieNode)
-			if err != nil {
+		next, err := s.walkStorage(ctx, seg, addrHash, acc.Root, nil, nil, splitAfter)
+		if err != nil {
+			return nil, err
+		}
+		if next != nil {
+			sg, sgctx := errgroup.WithContext(ctx)
+			for _, r := range splitRange(next, splitWays) {
+				sg.Go(func() error {
+					_, err := s.walkStorage(sgctx, seg, addrHash, acc.Root, r[0], r[1], 0)
+					return err
+				})
+			}
+			if err := sg.Wait(); err != nil {
 				return nil, err
-			}
-			resp, err := s.cfg.Client.GetLeafs(ctx, req)
-			if err != nil {
-				return nil, fmt.Errorf("sync: storage of %x: %w", addrHash, err)
-			}
-			slots := make([][2]schema.Hash, 0, len(resp.Keys))
-			for i := range resp.Keys {
-				if len(resp.Keys[i]) != 32 {
-					return nil, fmt.Errorf("sync: storage leaf key has %d bytes", len(resp.Keys[i]))
-				}
-				_, content, _, err := rlp.Split(resp.Vals[i])
-				if err != nil || len(content) > 32 {
-					return nil, fmt.Errorf("sync: storage value of %x: %v", addrHash, err)
-				}
-				var v schema.Hash
-				copy(v[32-len(content):], content)
-				slots = append(slots, [2]schema.Hash{schema.Hash(common.BytesToHash(resp.Keys[i])), v})
-			}
-			s.slots.Add(uint64(len(slots)))
-			if err := s.enqueue(ctx, bundle{seg: seg, apply: func(bl *store.Baseline) error {
-				for _, kv := range slots {
-					if err := bl.BaseSlot(addrHash, kv[0], kv[1]); err != nil {
-						return err
-					}
-				}
-				return nil
-			}}); err != nil {
-				return nil, err
-			}
-			if len(resp.Keys) == 0 || !resp.More {
-				break
-			}
-			start = incKey(resp.Keys[len(resp.Keys)-1])
-			if start == nil {
-				break
 			}
 		}
 	}
@@ -351,6 +334,100 @@ func (s *syncer) enqueue(ctx context.Context, b bundle) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// walkStorage fetches storage leaves of one trie in [start, end] (nil = open)
+// and enqueues slot bundles. maxReqs > 0 caps the number of requests: when
+// the cap is hit with leaves remaining, the next start key is returned so the
+// caller can fan out; a nil return means the range is exhausted.
+func (s *syncer) walkStorage(ctx context.Context, seg int, addrHash schema.Hash, root common.Hash, start, end []byte, maxReqs int) ([]byte, error) {
+	for n := 0; ; n++ {
+		if maxReqs > 0 && n >= maxReqs {
+			return start, nil
+		}
+		req, err := message.NewLeafsRequest(message.CorethLeafsRequestType,
+			root, common.Hash(addrHash), start, end, leafLimit, message.StateTrieNode)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := s.cfg.Client.GetLeafs(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("sync: storage of %x: %w", addrHash, err)
+		}
+		slots := make([][2]schema.Hash, 0, len(resp.Keys))
+		for i := range resp.Keys {
+			if len(resp.Keys[i]) != 32 {
+				return nil, fmt.Errorf("sync: storage leaf key has %d bytes", len(resp.Keys[i]))
+			}
+			_, content, _, err := rlp.Split(resp.Vals[i])
+			if err != nil || len(content) > 32 {
+				return nil, fmt.Errorf("sync: storage value of %x: %v", addrHash, err)
+			}
+			var v schema.Hash
+			copy(v[32-len(content):], content)
+			slots = append(slots, [2]schema.Hash{schema.Hash(common.BytesToHash(resp.Keys[i])), v})
+		}
+		s.slots.Add(uint64(len(slots)))
+		if err := s.enqueue(ctx, bundle{seg: seg, apply: func(bl *store.Baseline) error {
+			for _, kv := range slots {
+				if err := bl.BaseSlot(addrHash, kv[0], kv[1]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}}); err != nil {
+			return nil, err
+		}
+		if len(resp.Keys) == 0 || !resp.More {
+			return nil, nil
+		}
+		last := resp.Keys[len(resp.Keys)-1]
+		if len(end) > 0 && bytes.Compare(last, end) >= 0 {
+			return nil, nil
+		}
+		start = incKey(last)
+		if start == nil {
+			return nil, nil
+		}
+	}
+}
+
+// splitRange divides [from, ff..ff] into n contiguous inclusive sub-ranges.
+func splitRange(from []byte, n int) [][2][]byte {
+	lo := new(big.Int).SetBytes(from)
+	hi := new(big.Int).Lsh(big.NewInt(1), uint(len(from)*8))
+	hi.Sub(hi, big.NewInt(1))
+	span := new(big.Int).Sub(hi, lo)
+	if span.Sign() <= 0 || n <= 1 {
+		return [][2][]byte{{from, nil}}
+	}
+	step := new(big.Int).Div(span, big.NewInt(int64(n)))
+	if step.Sign() == 0 {
+		return [][2][]byte{{from, nil}}
+	}
+	pad := func(v *big.Int) []byte {
+		b := v.Bytes()
+		out := make([]byte, len(from))
+		copy(out[len(out)-len(b):], b)
+		return out
+	}
+	var out [][2][]byte
+	cur := new(big.Int).Set(lo)
+	for i := range n {
+		var endB []byte
+		if i == n-1 {
+			endB = nil // open end: the trie stops on its own
+		} else {
+			e := new(big.Int).Add(cur, step)
+			endB = pad(e)
+		}
+		out = append(out, [2][]byte{pad(cur), endB})
+		if i < n-1 {
+			cur.Add(cur, step)
+			cur.Add(cur, big.NewInt(1))
+		}
+	}
+	return out
 }
 
 // codeSweep fetches any code hash referenced by a committed account row but

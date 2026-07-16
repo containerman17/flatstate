@@ -310,6 +310,21 @@ func TestResume(t *testing.T) {
 	}
 }
 
+// TestGiantTrieSplit forces the giant-storage fan-out path (splitAfter=1,
+// splitWays=3 with 2-leaf responses) and checks every slot still lands.
+func TestGiantTrieSplit(t *testing.T) {
+	oldAfter, oldWays := splitAfter, splitWays
+	splitAfter, splitWays = 1, 3
+	t.Cleanup(func() { splitAfter, splitWays = oldAfter, oldWays })
+
+	f := makeFixture(t)
+	db := openStore(t)
+	if err := Run(context.Background(), Config{Client: f.client, DB: db, Height: testS, Root: testRoot, Workers: 4}); err != nil {
+		t.Fatal(err)
+	}
+	verifyLoaded(t, db, f)
+}
+
 // TestIncKey covers the boundary arithmetic the range walk depends on.
 func TestIncKey(t *testing.T) {
 	k := make([]byte, 8)
