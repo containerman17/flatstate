@@ -1,0 +1,10 @@
+{
+  "node_uri": "https://api.avax.network",
+  "bootstrap_peers": [],
+  "ws_urls": ["wss://api.avax.network/ext/bc/C/ws"],
+  "db_path": "/data/flatstate/main",
+  "tipbus_path": "/data/flatstate/tip",
+  "map_size_gb": 200,
+  "validator_refresh": "5m",
+  "poll_interval": "100ms"
+}

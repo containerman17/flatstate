@@ -110,8 +110,8 @@ func connLoop(ctx context.Context, url string, cfg Config, d *dedup, fatal chan<
 }
 
 type wsMessage struct {
-	ID     json.RawMessage `json:"id"`
-	Error  *struct {
+	ID    json.RawMessage `json:"id"`
+	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 	Method string `json:"method"`

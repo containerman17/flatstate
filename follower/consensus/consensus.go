@@ -98,6 +98,12 @@ type Config struct {
 	// via GetAncestors and executed before going live. Nil = start at the
 	// anchor (dry-run without a baseline).
 	Resume *Anchor
+	// SeedHeaders, if set, receives the headers of HeaderBackfill extra
+	// ancestors fetched BELOW the resume point (plus the resume header
+	// itself) before any execution, so the executor's BLOCKHASH window is
+	// complete from the first block.
+	SeedHeaders    func([]*ethtypes.Header)
+	HeaderBackfill uint64 // default 256 when SeedHeaders is set
 
 	Params snowball.Parameters // zero = snowball.DefaultParameters
 	// PollInterval is the live poll cadence while blocks are processing;
@@ -193,6 +199,9 @@ func New(cfg Config) (*Engine, error) {
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
+	}
+	if cfg.SeedHeaders != nil && cfg.HeaderBackfill == 0 {
+		cfg.HeaderBackfill = 256
 	}
 	return &Engine{
 		cfg:         cfg,
@@ -429,14 +438,23 @@ func (e *Engine) backfillContainer(c *net.Container) {
 	}
 	e.bfLow = c
 
-	resume := e.cfg.Resume
-	if resume == nil || h == resume.Height || h == 0 {
+	if h == e.backfillTarget() || h == 0 {
 		e.finishBootstrap()
-		return
 	}
-	if h < resume.Height {
-		e.fail(fmt.Errorf("consensus: network anchor chain passed below resume height %d without matching", resume.Height))
+}
+
+// backfillTarget is the lowest height the backfill walks to: the resume
+// point, minus the extra header window when the executor needs BLOCKHASH
+// ancestors. Resume nil (follow-only) stops at the anchor itself.
+func (e *Engine) backfillTarget() uint64 {
+	r := e.cfg.Resume
+	if r == nil {
+		return e.bfAnchor.Eth.NumberU64()
 	}
+	if e.cfg.SeedHeaders == nil || r.Height < e.cfg.HeaderBackfill {
+		return r.Height
+	}
+	return r.Height - e.cfg.HeaderBackfill
 }
 
 func (e *Engine) finishBootstrap() {
@@ -446,14 +464,26 @@ func (e *Engine) finishBootstrap() {
 	startHash := schema.Hash(start.Eth.Hash())
 
 	if r := e.cfg.Resume; r != nil {
-		if startHeight != r.Height {
-			e.fail(fmt.Errorf("consensus: backfill stopped at %d, resume is %d", startHeight, r.Height))
+		rc, ok := e.bfChain[r.Height]
+		if !ok {
+			e.fail(fmt.Errorf("consensus: backfill chain has no container at resume height %d", r.Height))
 			return
 		}
+		startHeight = r.Height
+		startHash = schema.Hash(rc.Eth.Hash())
 		if r.HashSet && startHash != r.EthHash {
 			e.fail(fmt.Errorf("consensus: chain hash %x at %d does not match store %x", startHash[:4], r.Height, r.EthHash[:4]))
 			return
 		}
+	}
+	if e.cfg.SeedHeaders != nil {
+		var headers []*ethtypes.Header
+		for h := start.Eth.NumberU64(); h <= startHeight; h++ {
+			if c, ok := e.bfChain[h]; ok {
+				headers = append(headers, c.Eth.Header())
+			}
+		}
+		e.cfg.SeedHeaders(headers)
 	}
 
 	sink, err := e.cfg.MakeSink(startHeight, startHash)

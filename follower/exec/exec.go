@@ -65,8 +65,9 @@ type Exec struct {
 	snowCtx  *snow.Context
 
 	mu        sync.Mutex
-	pending   map[schema.Hash]*layer         // executed, above finalized, by eth hash
+	pending   map[schema.Hash]*layer           // executed, above finalized, by eth hash
 	headers   map[common.Hash]*ethtypes.Header // parent chain for BLOCKHASH + upgrade timestamps
+	dryBase   *layer                           // dry-run only: folded accepted diffs (store is read-only)
 	finalized uint64
 }
 
@@ -110,6 +111,24 @@ func (e *Exec) SeedHeaders(headers []*ethtypes.Header) {
 func (e *Exec) OnFinalized(height uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.prune(height)
+}
+
+// FoldFinalized is the dry-run replacement for OnFinalized: the store is
+// read-only and never advances, so accepted diffs fold into an in-memory
+// base consulted between the pending layers and the store. Never mix with
+// OnFinalized in one process.
+func (e *Exec) FoldFinalized(b *capture.Batch) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.dryBase == nil {
+		e.dryBase = newLayer(&capture.Batch{})
+	}
+	e.dryBase.apply(b.Ops)
+	e.prune(b.Block)
+}
+
+func (e *Exec) prune(height uint64) {
 	e.finalized = height
 	for h, l := range e.pending {
 		if l.block <= height {
@@ -138,6 +157,9 @@ func (e *Exec) viewAt(parent schema.Hash) *view {
 		}
 		layers = append(layers, l)
 		h = l.parent
+	}
+	if e.dryBase != nil {
+		layers = append(layers, e.dryBase)
 	}
 	return &view{db: e.db, layers: layers}
 }

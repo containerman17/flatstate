@@ -25,7 +25,7 @@ import (
 // lives inside store.GetAccount/GetSlot.
 type view struct {
 	db     *store.DB
-	layers []*layer // newest first
+	layers []*layer // newest first; a dry-run fold base, if any, is last
 }
 
 // layer is one executed-but-unfinalized block's diff, compiled for lookup
@@ -48,8 +48,16 @@ func newLayer(b *capture.Batch) *layer {
 		destructed: make(map[schema.Address]bool),
 		codes:      make(map[schema.Hash][]byte),
 	}
-	for i := range b.Ops {
-		op := &b.Ops[i]
+	l.apply(b.Ops)
+	return l
+}
+
+// apply folds ops in batch order. Reads check accounts/slots before
+// destructed, so a destruct-then-recreate (destruct clears, later ops
+// repopulate) keeps working when layers are folded cumulatively.
+func (l *layer) apply(ops []capture.Op) {
+	for i := range ops {
+		op := &ops[i]
 		switch op.Kind {
 		case capture.OpAccount:
 			l.accounts[op.Addr] = op.Account
@@ -69,7 +77,6 @@ func newLayer(b *capture.Batch) *layer {
 			l.codes[op.CodeHash] = op.Code
 		}
 	}
-	return l
 }
 
 func (v *view) account(addr schema.Address) (schema.Account, bool, error) {

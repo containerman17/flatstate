@@ -64,8 +64,8 @@ type fakeSink struct {
 	accepted    []uint64
 }
 
-func (s *fakeSink) Verified(b *capture.Batch)     { s.verified = append(s.verified, b.Block) }
-func (s *fakeSink) Head(h schema.Hash) error      { s.heads = append(s.heads, h); return nil }
+func (s *fakeSink) Verified(b *capture.Batch) { s.verified = append(s.verified, b.Block) }
+func (s *fakeSink) Head(h schema.Hash) error  { s.heads = append(s.heads, h); return nil }
 func (s *fakeSink) Accepted(b uint64, _ schema.Hash) error {
 	s.accepted = append(s.accepted, b)
 	return nil
@@ -273,4 +273,47 @@ func (e *Engine) sendPollForTest() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.sendPoll()
+}
+
+// TestHeaderBackfill: with SeedHeaders set, the backfill walks HeaderBackfill
+// blocks below the resume point and hands their headers over before executing.
+func TestHeaderBackfill(t *testing.T) {
+	cs := chain(t, 3) // 100 (header window), 101 resume, 102, 103 anchor
+	fn := &fakeNet{}
+	sink := &fakeSink{}
+	var seeded []uint64
+	e, err := New(Config{
+		Net:  fn,
+		Exec: HeaderOnly{},
+		MakeSink: func(h uint64, hash schema.Hash) (Sink, error) {
+			sink.startHeight, sink.startHash = h, hash
+			return sink, nil
+		},
+		Resume: &Anchor{Height: 101, EthHash: schema.Hash(cs[1].Eth.Hash()), HashSet: true},
+		SeedHeaders: func(hs []*ethtypes.Header) {
+			for _, h := range hs {
+				seeded = append(seeded, h.Number.Uint64())
+			}
+		},
+		HeaderBackfill: 1,
+		Params:         testParams(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Tick()
+	e.OnChits(vdr, fn.pullQueries[0].reqID, cs[3].ID, cs[3].ID, cs[3].ID, 103)
+	e.OnContainer(vdr, cs[3].Bytes)
+	e.OnAncestors(vdr, fn.reqID, [][]byte{cs[2].Bytes, cs[1].Bytes, cs[0].Bytes})
+	checkNoFatal(t, e)
+	if sink.startHeight != 101 {
+		t.Fatalf("start %d", sink.startHeight)
+	}
+	if len(seeded) != 2 || seeded[0] != 100 || seeded[1] != 101 {
+		t.Fatalf("seeded headers %v", seeded)
+	}
+	// Gap 102..103 executed and accepted.
+	if len(sink.accepted) != 2 || sink.accepted[0] != 102 || sink.accepted[1] != 103 {
+		t.Fatalf("accepted %v", sink.accepted)
+	}
 }
