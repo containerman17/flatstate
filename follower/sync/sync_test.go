@@ -323,6 +323,23 @@ func TestGiantTrieSplit(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyLoaded(t, db, f)
+
+	// The sub-range resume watermark helper sees the committed slots.
+	conHash := store.Keccak(f.contract[:])
+	var want schema.Hash
+	for slot := range f.slots {
+		h := store.Keccak(slot[:])
+		if bytes.Compare(h[:], want[:]) > 0 {
+			want = h
+		}
+	}
+	got, ok, err := db.MaxBaseSlot(conHash, nil, nil)
+	if err != nil || !ok || got != want {
+		t.Fatalf("MaxBaseSlot = %x ok=%v err=%v; want %x", got, ok, err, want)
+	}
+	if _, ok, err := db.MaxBaseSlot(store.Keccak([]byte("nobody")), nil, nil); err != nil || ok {
+		t.Fatalf("MaxBaseSlot for unknown account: ok=%v err=%v", ok, err)
+	}
 }
 
 // TestIncKey covers the boundary arithmetic the range walk depends on.

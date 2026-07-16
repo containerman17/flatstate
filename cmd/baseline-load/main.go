@@ -55,11 +55,12 @@ func main() {
 
 func run() error {
 	var (
-		dbPath  = flag.String("db", "", "flatstate LMDB env path (created if needed)")
-		mapGB   = flag.Int64("map-size-gb", 200, "LMDB map size in GiB")
-		nodeURI = flag.String("node-uri", fnet.DefaultNodeURI, "public node for bootstrap RPC")
-		workers = flag.Int("workers", 32, "concurrent leaf-range fetchers")
-		height  = flag.Uint64("height", 0, "pivot height S (0 = latest summary boundary)")
+		dbPath   = flag.String("db", "", "flatstate LMDB env path (created if needed)")
+		mapGB    = flag.Int64("map-size-gb", 200, "LMDB map size in GiB")
+		nodeURI  = flag.String("node-uri", fnet.DefaultNodeURI, "public node for bootstrap RPC")
+		workers  = flag.Int("workers", 32, "concurrent leaf-range fetchers")
+		inflight = flag.Int("inflight", 320, "global cap on outstanding leaf/code requests")
+		height   = flag.Uint64("height", 0, "pivot height S (0 = latest summary boundary)")
 	)
 	flag.Parse()
 	if *dbPath == "" {
@@ -120,7 +121,7 @@ func run() error {
 		return fmt.Errorf("net: %w", err)
 	}
 	defer network.Close()
-	nc = fsync.NewNetClient(network)
+	nc = fsync.NewNetClient(network, *inflight)
 
 	client := syncclient.New(&syncclient.Config{
 		Network: nc,
@@ -128,12 +129,13 @@ func run() error {
 		Stats:   stats.NewNoOpStats(),
 	})
 	return fsync.Run(ctx, fsync.Config{
-		Client:  client,
-		DB:      db,
-		Height:  s,
-		Root:    root,
-		Workers: *workers,
-		Log:     log,
+		Client:   client,
+		DB:       db,
+		Height:   s,
+		Root:     root,
+		Workers:  *workers,
+		Log:      log,
+		Timeouts: nc.Timeouts,
 	})
 }
 

@@ -261,6 +261,54 @@ func (d *DB) MaxBaseAccountWithPrefix(p byte) (h schema.Hash, ok bool, err error
 	return
 }
 
+// MaxBaseSlot returns the greatest committed 0x08 slot hash of addrHash
+// within [start, end] (inclusive; nil end = to the top of the keyspace).
+// Loader resume for storage sub-ranges: each sub-walker commits its slots
+// contiguously from its start, so this is a sound per-sub-range watermark.
+func (d *DB) MaxBaseSlot(addrHash schema.Hash, start, end []byte) (h schema.Hash, ok bool, err error) {
+	err = d.env.View(func(txn *lmdb.Txn) error {
+		txn.RawRead = true
+		cur, err := txn.OpenCursor(d.dbi)
+		if err != nil {
+			return err
+		}
+		defer cur.Close()
+		seek := make([]byte, 65)
+		seek[0] = schema.PrefBaseSlot
+		copy(seek[1:33], addrHash[:])
+		if end == nil {
+			for i := 33; i < 65; i++ {
+				seek[i] = 0xff
+			}
+		} else {
+			copy(seek[33:65], end)
+		}
+		k, _, err := cur.Get(seek, nil, lmdb.SetRange)
+		switch {
+		case lmdb.IsNotFound(err):
+			k, _, err = cur.Get(nil, nil, lmdb.Last)
+		case err == nil && !bytes.Equal(k, seek):
+			k, _, err = cur.Get(nil, nil, lmdb.Prev)
+		}
+		if lmdb.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if len(k) != 65 || k[0] != schema.PrefBaseSlot || !bytes.Equal(k[1:33], addrHash[:]) {
+			return nil
+		}
+		if start != nil && bytes.Compare(k[33:65], start) < 0 {
+			return nil
+		}
+		copy(h[:], k[33:65])
+		ok = true
+		return nil
+	})
+	return
+}
+
 // MissingCodeHashes scans the 0x07 baseline accounts and returns the unique
 // referenced code hashes that have no 0x06 row yet (loader code sweep).
 // One long read txn; run it only while the writer is quiet.

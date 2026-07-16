@@ -47,6 +47,9 @@ type Config struct {
 	Root    common.Hash // state root of block S
 	Workers int         // concurrent segment fetchers; <=0 = 32
 	Log     *slog.Logger
+	// Timeouts optionally reports cumulative request timeouts for the
+	// progress log (congestion visibility).
+	Timeouts func() uint64
 }
 
 const leafLimit = 1024 // server-side response cap
@@ -58,6 +61,9 @@ const storageConcurrency = 6
 // Giant storage tries dominate the load's tail: after splitAfter sequential
 // responses a trie is declared giant and the rest of its keyspace is fetched
 // as splitWays parallel sub-ranges. Vars so tests can shrink them.
+// DO NOT change the values between runs of the same store: sub-range resume
+// watermarks (MaxBaseSlot) are only sound while the split boundaries are
+// reproducible.
 var (
 	splitAfter = 32
 	splitWays  = 16
@@ -160,9 +166,14 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			case <-tick.C:
 				el := time.Since(t0).Seconds()
-				cfg.Log.Info("baseline sync progress",
+				args := []any{
 					"accounts", s.accounts.Load(), "slots", s.slots.Load(), "codes", s.codes.Load(),
-					"rows_per_sec", uint64(float64(s.accounts.Load()+s.slots.Load())/el))
+					"rows_per_sec", uint64(float64(s.accounts.Load()+s.slots.Load()) / el),
+				}
+				if cfg.Timeouts != nil {
+					args = append(args, "timeouts", cfg.Timeouts())
+				}
+				cfg.Log.Info("baseline sync progress", args...)
 			}
 		}
 	}()
@@ -340,7 +351,23 @@ func (s *syncer) enqueue(ctx context.Context, b bundle) error {
 // and enqueues slot bundles. maxReqs > 0 caps the number of requests: when
 // the cap is hit with leaves remaining, the next start key is returned so the
 // caller can fan out; a nil return means the range is exhausted.
+//
+// Sub-range mode (maxReqs == 0) resumes past the greatest already-committed
+// slot in its range: sub-walkers commit contiguously from their start, so
+// rows below the watermark are complete. The sequential warmup cannot use
+// this (an earlier run's fan-out leaves holes across, never within, ranges).
 func (s *syncer) walkStorage(ctx context.Context, seg int, addrHash schema.Hash, root common.Hash, start, end []byte, maxReqs int) ([]byte, error) {
+	if maxReqs == 0 {
+		if wm, ok, err := s.cfg.DB.MaxBaseSlot(addrHash, start, end); err != nil {
+			return nil, err
+		} else if ok {
+			if next := incKey(wm[:]); next == nil || (len(end) > 0 && bytes.Compare(next, end) > 0) {
+				return nil, nil // range already fully committed
+			} else if bytes.Compare(next, start) > 0 {
+				start = next
+			}
+		}
+	}
 	for n := 0; ; n++ {
 		if maxReqs > 0 && n >= maxReqs {
 			return start, nil
