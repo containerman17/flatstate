@@ -19,7 +19,13 @@ import (
 var (
 	errNoPeer           = errors.New("sync: no responsive peer available")
 	errAppRequestFailed = errors.New("sync: peer answered with AppError")
+	errTimeout          = errors.New("sync: request timed out")
 )
+
+// badPeerCooldown keeps a peer out of rotation after a timeout or AppError:
+// non-serving peers (firewood scheme, throttlers) otherwise burn a 10s
+// in-flight slot on every visit.
+const badPeerCooldown = 3 * time.Minute
 
 // NetClient adapts follower/net to the coreth sync client's Network
 // interface: synchronous AppRequest exchange. Legacy coreth sync handlers
@@ -41,6 +47,7 @@ type NetClient struct {
 
 	peerMu      gosync.Mutex
 	outstanding map[ids.NodeID]int
+	badUntil    map[ids.NodeID]time.Time
 }
 
 // perPeerCap bounds outstanding requests per peer: hundreds of concurrent
@@ -65,6 +72,7 @@ func NewNetClient(n *net.Network, inflight int) *NetClient {
 		sem:         make(chan struct{}, inflight),
 		pending:     make(map[uint32]chan appReply),
 		outstanding: make(map[ids.NodeID]int),
+		badUntil:    make(map[ids.NodeID]time.Time),
 	}
 }
 
@@ -92,6 +100,11 @@ func (c *NetClient) SendSyncedAppRequestAny(ctx context.Context, _ *version.Appl
 	}
 	defer c.releasePeer(nodeID)
 	resp, err := c.SendSyncedAppRequest(ctx, nodeID, request)
+	if errors.Is(err, errTimeout) || errors.Is(err, errAppRequestFailed) {
+		c.peerMu.Lock()
+		c.badUntil[nodeID] = time.Now().Add(badPeerCooldown)
+		c.peerMu.Unlock()
+	}
 	return resp, nodeID, err
 }
 
@@ -102,13 +115,27 @@ func (c *NetClient) pickPeer() (ids.NodeID, bool) {
 	}
 	c.peerMu.Lock()
 	defer c.peerMu.Unlock()
+	now := time.Now()
 	off := mrand.IntN(len(peers))
+	var fallback ids.NodeID
+	var haveFallback bool
 	for i := range peers {
 		id := peers[(off+i)%len(peers)]
-		if c.outstanding[id] < perPeerCap {
-			c.outstanding[id]++
-			return id, true
+		if c.outstanding[id] >= perPeerCap {
+			continue
 		}
+		if now.Before(c.badUntil[id]) {
+			if !haveFallback {
+				fallback, haveFallback = id, true
+			}
+			continue
+		}
+		c.outstanding[id]++
+		return id, true
+	}
+	if haveFallback { // everyone healthy is saturated; revisit a bad peer
+		c.outstanding[fallback]++
+		return fallback, true
 	}
 	return ids.EmptyNodeID, false
 }
@@ -158,7 +185,7 @@ func (c *NetClient) SendSyncedAppRequest(ctx context.Context, nodeID ids.NodeID,
 		return r.bytes, nil
 	case <-t.C:
 		c.timeouts.Add(1)
-		return nil, fmt.Errorf("sync: request %d to %s timed out", id, nodeID)
+		return nil, fmt.Errorf("%w: request %d to %s", errTimeout, id, nodeID)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
