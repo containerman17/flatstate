@@ -15,6 +15,7 @@ Packages (bottom up):
 - `mem`: lazily pinned base map, unfinalized layer stack, per-executor side buffers, batch-phase locking.
 - `engine`: batch execution over an executor pool with tip-hash stamping and stale-batch requeue; the EVM plugs in via the Executor interface.
 - `replay`: block-by-block history sessions interleaved with the mempool log by timestamp.
+- `node`: writer-process glue. Composite Sink (store -> mem -> watermark in D7 order, tipbus publish), Tracker (verified/head/accepted node events to Sink calls), baseline job over a StateIterator. The avalanchego-facing capture source needs a small fork patch; see [docs/node-integration.md](docs/node-integration.md).
 - `suitecache`: per-(suite, block) flat-file cache for correctness test loops.
 
-Status: core storage/memory/engine layers built and tested; node integration (avalanchego capture) not wired yet.
+Status: core storage/memory/engine layers built and tested; node-side glue (Sink/Tracker/baseline) built and tested; the avalanchego capture hook itself requires the fork patch documented in docs/node-integration.md.
