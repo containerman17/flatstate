@@ -7,6 +7,7 @@ require (
 	github.com/ava-labs/avalanchego v1.14.2
 	github.com/ava-labs/avalanchego/graft/coreth v1.14.2
 	github.com/ava-labs/libevm v1.13.14-0.4.0.rc.2
+	github.com/gorilla/websocket v1.5.0
 	github.com/holiman/uint256 v1.3.2
 	github.com/prometheus/client_golang v1.23.0
 	golang.org/x/crypto v0.54.0
@@ -52,7 +53,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/mux v1.8.0 // indirect
 	github.com/gorilla/rpc v1.2.0 // indirect
-	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.1 // indirect
 	github.com/holiman/bloomfilter/v2 v2.0.3 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
