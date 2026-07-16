@@ -215,6 +215,9 @@ func (n *Network) IsConnected(nodeID ids.NodeID) bool { return n.handler.isConne
 // NumConnected returns the number of connected peers.
 func (n *Network) NumConnected() int { return n.handler.numConnected() }
 
+// ConnectedPeers returns a snapshot of currently connected peer IDs.
+func (n *Network) ConnectedPeers() []ids.NodeID { return n.handler.connectedList() }
+
 // SelectPeer picks a responsive peer for a Get-style request.
 func (n *Network) SelectPeer() (ids.NodeID, bool) { return n.tracker.SelectPeer() }
 

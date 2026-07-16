@@ -74,6 +74,12 @@ func (h *handler) numConnected() int {
 	return h.connected.Len()
 }
 
+func (h *handler) connectedList() []ids.NodeID {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.connected.List()
+}
+
 func (h *handler) HandleInbound(_ context.Context, msg *message.InboundMessage) {
 	defer msg.OnFinishedHandling()
 	switch msg.Op {

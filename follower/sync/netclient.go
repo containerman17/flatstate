@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	gosync "sync"
 	"sync/atomic"
 	"time"
@@ -37,7 +38,16 @@ type NetClient struct {
 
 	mu      gosync.Mutex
 	pending map[uint32]chan appReply
+
+	peerMu      gosync.Mutex
+	outstanding map[ids.NodeID]int
 }
+
+// perPeerCap bounds outstanding requests per peer: hundreds of concurrent
+// callers through the tracker's SelectPeer all pile onto the few "best"
+// peers, which then throttle us (measured: 8x slowdown). Random spread over
+// every connected peer with a small per-peer cap keeps all of them busy.
+const perPeerCap = 4
 
 type appReply struct {
 	bytes  []byte
@@ -51,9 +61,10 @@ func NewNetClient(n *net.Network, inflight int) *NetClient {
 		inflight = 320
 	}
 	return &NetClient{
-		net:     n,
-		sem:     make(chan struct{}, inflight),
-		pending: make(map[uint32]chan appReply),
+		net:         n,
+		sem:         make(chan struct{}, inflight),
+		pending:     make(map[uint32]chan appReply),
+		outstanding: make(map[ids.NodeID]int),
 	}
 }
 
@@ -71,16 +82,45 @@ func (c *NetClient) OnAppResponse(_ ids.NodeID, requestID uint32, response []byt
 	}
 }
 
-// SendSyncedAppRequestAny sends to a tracker-selected responsive peer.
+// SendSyncedAppRequestAny sends to a random connected peer with capacity.
 // The minVersion filter is ignored: every current mainnet peer far exceeds
 // the sync client's minimum.
 func (c *NetClient) SendSyncedAppRequestAny(ctx context.Context, _ *version.Application, request []byte) ([]byte, ids.NodeID, error) {
-	nodeID, ok := c.net.SelectPeer()
+	nodeID, ok := c.pickPeer()
 	if !ok {
 		return nil, ids.EmptyNodeID, errNoPeer
 	}
+	defer c.releasePeer(nodeID)
 	resp, err := c.SendSyncedAppRequest(ctx, nodeID, request)
 	return resp, nodeID, err
+}
+
+func (c *NetClient) pickPeer() (ids.NodeID, bool) {
+	peers := c.net.ConnectedPeers()
+	if len(peers) == 0 {
+		return ids.EmptyNodeID, false
+	}
+	c.peerMu.Lock()
+	defer c.peerMu.Unlock()
+	off := mrand.IntN(len(peers))
+	for i := range peers {
+		id := peers[(off+i)%len(peers)]
+		if c.outstanding[id] < perPeerCap {
+			c.outstanding[id]++
+			return id, true
+		}
+	}
+	return ids.EmptyNodeID, false
+}
+
+func (c *NetClient) releasePeer(id ids.NodeID) {
+	c.peerMu.Lock()
+	if c.outstanding[id] <= 1 {
+		delete(c.outstanding, id)
+	} else {
+		c.outstanding[id]--
+	}
+	c.peerMu.Unlock()
 }
 
 // SendSyncedAppRequest sends one AppRequest and blocks for its response.
