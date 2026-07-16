@@ -25,13 +25,21 @@ Three workloads:
 
 Prior measured data (internal quoting engine, March-June 2026): the interpreter loop is ~98% of CPU; the state layer is <5%; Go holiman/uint256 benchmarked 1.2x FASTER than Rust ruint on hot V3 math. The endgame is bypassing the interpreter with closed-form pool formulas anyway, so interpreter speed is a temporary concern and state-layer language choice is not the battleground. Go also keeps us close to avalanchego for embedding.
 
-### D2. Embedded node, real consensus, one writer process
+### D2. Custom C-chain follower, not an embedded node (rev 2)
 
-We run avalanchego as a library (real consensus, no upstream node, no RPC ingestion). Firewood validates every block's state root in-process before accept, so everything we capture from accepted blocks is pre-validated for free. Firewood's only job in this design is consensus/root validation; it is never on any read path.
+Rev 1 embedded the full avalanchego node as a library. Superseded: the capture hook point inside coreth/firewood is not exposed and would have required a fork. Instead we assemble a minimal C-chain follower from avalanchego packages, taking chunks as libraries and owning the rest:
+
+- **P2P**: avalanchego's `network` stack with an ephemeral staking cert (proven recipe in deforestationdb `blockfetcher/`, ~200 LOC): `NewTestNetworkConfig`/`NewTestNetwork`, `ManuallyTrack` peers, custom `HandleInbound`, `message.Creator`, `PeerTracker`.
+- **Validator set**: fetched and periodically refreshed from public P-chain RPC (`platform.getCurrentValidators` on api.avax.network); peer IPs via `info.peers`. The P-chain VM is never run.
+- **Finality**: real snowman sampling against that weighted validator set (PullQuery/Chits polling). Gossip (`Put`) provides the preferred tip; our own polls decide acceptance. Decided over a depth/quorum heuristic: finality is verified locally, not trusted.
+- **Execution**: coreth's state transition as a library (`NewEVMBlockContext` + `ApplyTransaction`, deforestationdb `executor/` precedent) against OUR statedb. No Firewood, no trie, no full node, no fork, no replace directives.
+- **Mempool**: NOT from our p2p. A plain WebSocket client subscribed to external nodes (`newPendingTransactions`); arrivals are timestamped at receipt.
+
+Validation trade (recorded honestly): rev 1 got state-root checking free from Firewood. Without a trie we cannot compute state roots. Per-block validation is now: snowman acceptance (network-verified finality) + computed receiptsRoot, gasUsed, logsBloom compared against the header, fail loud on mismatch. Silent state divergence with matching receipts is theoretically possible and accepted; a periodic cross-check of sampled accounts against a public archival RPC is the cheap watchdog if wanted.
 
 ### D3. Preimage keys everywhere
 
-We hook capture ABOVE the Firewood adapter, at the statedb commit layer, where address and slot preimages are still known (the Firewood batch ops are already hashed-key; ava-labs/avalanchego PR 5624 mirrors those, we deliberately do not). Our entire store is keyed by `(address, slot)` preimages. No trie, no hashed keys, no keccak on any read path. Capture is a one-line mirror per mutation (put account / put slot / delete / destruct), post-image only. PR 5624 measured ~1.2x overhead for the same capture pattern during bootstrap re-execution.
+Capture is native: we own the statedb the follower executes against, so every mutation (put account / put slot / delete / destruct) is recorded with address and slot preimages as a side effect of our own commit code. Our entire store is keyed by `(address, slot)` preimages. No trie, no hashed keys, no keccak on any read path (one exception: baseline probes, see D6).
 
 ### D4. LMDB is the readers' single source of truth
 
@@ -69,18 +77,20 @@ Selfdestruct: a destruct marker row per (address, block). Slot reads at height B
 0x04 | block(8)                          -> per-block diff (encoded key/value list, the capture batch verbatim)
 0x05 | seq(8)                            -> mempool arrival log entry (tx bytes + arrival timestamp)
 0x06 | code hash(32)                     -> contract code (deduped)
+0x07 | keccak(addr)(32)                  -> baseline account at S (hash-keyed, see below)
+0x08 | keccak(addr)(32) | keccak(slot)(32) -> baseline slot at S (hash-keyed, see below)
 meta: baseline_complete watermark, finalized height, history genesis S
 ```
 
 `^block` = bitwise-inverted block number, so a forward `SetRange` seek on `key || ^B` lands on the greatest write at or before B in one hop (idea from PR 5624).
 
-**Snapshot baseline**: when state sync first completes at height S, capture starts immediately for S+1, S+2, ... while a background job iterates the full state at the pinned Firewood revision S and writes every key as a row at `^S`. Until the `baseline_complete` watermark is set, reads of not-yet-covered keys fail loud. After it: every key in existence has a row, a key with no rows simply did not exist, and no fallback to Firewood is ever needed. This is what lets us keep state sync (PR 5624 requires sync-from-genesis; the pivot baseline was their stated follow-up, we just build it).
+**Snapshot baseline (rev 2: hash-keyed)**: no full-state enumeration with preimage keys exists anywhere (firewood revisions, geth snapshots, and state-sync leaves are all keccak-keyed; preimages only exist in genesis JSON plus executed transactions). So the baseline at height S is stored under HASHED keys (a dedicated keyspace, `keccak(addr)` / `keccak(addr)||keccak(slot)`), sourced from a state-sync artifact or a synced node's snapshot at S. Read order: (1) preimage history rows, (2) on miss, one keccak to probe the hash-keyed baseline, (3) still nothing = the value is zero, pinned in memory as a known zero. Cost: one keccak per cold key EVER, off the steady-state path; the pin (and any later write) is preimage-keyed. The zero-pin matters: V3/V4 tick probes hammer nonexistent slots; each costs one keccak + one failed seek once, then it is a ~30ns map hit forever. Until the `baseline_complete` watermark is set, reads of not-yet-covered keys fail loud.
 
 Reasoning for 0x04: replay must advance a session view block by block in O(diff); without per-block diff rows it would degenerate into per-key seeks (~200k/block). The diff row is the capture batch we already have in hand, so writing it is free.
 
 ### D7. Finalized-only persistence; unfinalized is ephemeral
 
-The main LMDB env only ever contains data from ACCEPTED blocks. Unfinalized (processing/preferred) block diffs and mempool arrivals are published to a SEPARATE ephemeral LMDB env that is truncated at node boot. Consequence: a restart can never resume on a fork, by construction; there is no poisoned-row detection problem because poison never persists.
+The main LMDB env only ever contains data from ACCEPTED blocks. Unfinalized (processing/preferred) block diffs and mempool arrivals are published to a SEPARATE ephemeral LMDB env that is truncated at follower boot. Consequence: a restart can never resume on a fork, by construction; there is no poisoned-row detection problem because poison never persists.
 
 Write ordering per accepted block: (1) main-env LMDB write txn commits, (2) in-memory base override, (3) finalized-height watermark bump. A concurrent reader miss during apply therefore cannot pin a stale value: LMDB runs ahead of the base map, never behind. Bootstrap replay after a crash rewrites identical rows (idempotent), same invariant as PR 5624 ("history durable before state commit").
 
@@ -103,13 +113,13 @@ The landmine this design must respect: a cold miss during a read phase MUST NOT 
 
 Staleness: every batch is stamped with the preferred-tip hash at RLock time; results whose stamp no longer matches the current tip are discarded and requeued. The write phase never coordinates with readers.
 
-### D10. Process topology: one node, N equal readers
+### D10. Process topology: one follower, N equal readers
 
-- **Node process** (the only writer): embedded avalanchego consensus + Firewood + capture + main LMDB env writer + ephemeral tip env publisher.
+- **Follower process** (the only writer): the D2 rev 2 follower (p2p + snowman sampling + coreth-as-library execution) + capture + external mempool WS client + main LMDB env writer + ephemeral tip env publisher.
 - **Bot processes** (any number, all equal): open main env read-only for state, poll the ephemeral env for tip diffs, preference resets, and mempool arrivals. Polling = reading a `seq` counter key (~100ns mmap read); sleep-polling gives ~0.5-1ms tip latency, busy-poll on a pinned goroutine gives 10-100 microseconds. Publish cost: one NOSYNC txn per event (~5 microseconds for a mempool tx, ~50-100 microseconds for a block diff), paid once regardless of reader count.
 - **Test/replay processes**: main env read-only; they do not need the tip env.
 
-Reasoning: bots redeploy dozens of times a day during development; the node must never restart with them because mempool history is irrecoverable (a node restart also costs tens of seconds of bootstrap and a capture gap). LMDB has no watch/subscribe; polling a counter at this cost is simpler than a socket protocol and was chosen over one deliberately. There is NO HTTP/RPC state serving anywhere: readers treat LMDB as a shared read-only memory segment. Calibration: mempool propagation jitter over p2p is tens of ms; a ~100 microsecond bus is noise.
+Reasoning: bots redeploy dozens of times a day during development; the follower must never restart with them because mempool history is irrecoverable. LMDB has no watch/subscribe; polling a counter at this cost is simpler than a socket protocol and was chosen over one deliberately. There is NO HTTP/RPC state serving anywhere: readers treat LMDB as a shared read-only memory segment. Calibration: mempool propagation jitter over p2p is tens of ms; a ~100 microsecond bus is noise.
 
 ### D11. Test-suite snapshot cache
 
