@@ -18,9 +18,9 @@
 //
 // Deviations from the real engine, all fail-safe (they can only delay
 // acceptance, never accept something the network did not):
-//   - Chits votes whose blocks we cannot fetch are dropped after bubbling
-//     through known-but-unissued ancestors; the real engine additionally
-//     blocks vote application on in-flight fetches.
+//   - Chits votes naming an unknown block are parked while the block is
+//     fetched (Get) and applied when it arrives, or dropped on timeout; the
+//     real engine does the same through its job scheduler.
 //   - No push gossip and no query serving: we never answer PullQuery (we
 //     are not a validator; nobody samples us).
 //   - Poll expiry is a coarse per-tick sweep instead of a per-request
@@ -107,9 +107,16 @@ type Config struct {
 
 	Params snowball.Parameters // zero = snowball.DefaultParameters
 	// PollInterval is the live poll cadence while blocks are processing;
-	// IdlePollInterval is the discovery cadence while quiesced.
+	// IdlePollInterval is the discovery cadence while quiesced. PollTimeout
+	// bounds how long a poll that cannot early-terminate holds one of the
+	// ConcurrentRepolls slots. Keep it generous: expiring a poll whose real
+	// chits are still in flight fails it, and every failed poll resets
+	// snowball confidence (beta consecutive successes required), which is
+	// how acceptance stalls. Measured live 2026-07-16: 3s stalled, 10s
+	// tracked the chain.
 	PollInterval     time.Duration // default 100ms
 	IdlePollInterval time.Duration // default 1s
+	PollTimeout      time.Duration // default net.RequestTimeout
 	Log              *slog.Logger
 }
 
@@ -135,6 +142,16 @@ type pollState struct {
 type getReq struct {
 	deadline time.Time
 	tries    int
+}
+
+// parkedVote is a chit whose blocks were unknown when it arrived; it is
+// retried when the blocking container shows up (mirrors the real engine's
+// blocked-jobs scheduling, minimally).
+type parkedVote struct {
+	requestID uint32
+	nodeID    ids.NodeID
+	options   []ids.ID // decreasing height: preferred, preferredAtHeight
+	deadline  time.Time
 }
 
 // Engine drives consensus. All exported methods are concurrency-safe; wire
@@ -170,10 +187,16 @@ type Engine struct {
 	polls       poll.Set
 	pollVdrs    map[uint32]*pollState
 	recs        map[ids.ID]*rec
-	pendingByPa map[ids.ID][]ids.ID // children container IDs waiting for parent
-	gets        map[ids.ID]*getReq  // outstanding container fetches
+	pendingByPa map[ids.ID][]ids.ID     // children container IDs waiting for parent
+	gets        map[ids.ID]*getReq      // outstanding container fetches
+	parked      map[ids.ID][]parkedVote // votes blocked on an unknown container
+	frontiers   map[ids.NodeID]ids.ID   // per-peer last known accepted frontier
 	lastPollAt  time.Time
 	lastPref    schema.Hash
+	pollsOK     uint64
+	pollsFailed uint64
+	sampledOff  uint64 // sampled-but-unconnected validators (vote loss source)
+	sampledAll  uint64
 
 	lastAcceptedID      ids.ID
 	lastAcceptedHeight  uint64
@@ -187,6 +210,11 @@ func New(cfg Config) (*Engine, error) {
 	}
 	if cfg.Params == (snowball.Parameters{}) {
 		cfg.Params = snowball.DefaultParameters
+		// Our polls complete in ~2-3s (chits plus parked-vote resolution),
+		// not the ~500ms of a well-connected validator; more polls in
+		// flight compensate so beta accumulates at chain pace. Measured
+		// live 2026-07-16: 4 in flight = 1.4 polls/s = crawl-and-burst.
+		cfg.Params.ConcurrentRepolls = 16
 	}
 	if err := cfg.Params.Verify(); err != nil {
 		return nil, err
@@ -196,6 +224,9 @@ func New(cfg Config) (*Engine, error) {
 	}
 	if cfg.IdlePollInterval <= 0 {
 		cfg.IdlePollInterval = time.Second
+	}
+	if cfg.PollTimeout <= 0 {
+		cfg.PollTimeout = net.RequestTimeout
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
@@ -214,6 +245,8 @@ func New(cfg Config) (*Engine, error) {
 		recs:        make(map[ids.ID]*rec),
 		pendingByPa: make(map[ids.ID][]ids.ID),
 		gets:        make(map[ids.ID]*getReq),
+		parked:      make(map[ids.ID][]parkedVote),
+		frontiers:   make(map[ids.NodeID]ids.ID),
 	}, nil
 }
 
@@ -268,6 +301,7 @@ func (e *Engine) OnChits(nodeID ids.NodeID, requestID uint32, preferred, preferr
 	if e.phase != phaseLive {
 		return
 	}
+	e.frontiers[nodeID] = accepted
 	ps, ok := e.pollVdrs[requestID]
 	if !ok || !ps.remaining.Contains(nodeID) {
 		return
@@ -277,24 +311,47 @@ func (e *Engine) OnChits(nodeID ids.NodeID, requestID uint32, preferred, preferr
 		delete(e.pollVdrs, requestID)
 	}
 
-	// Fetch unknown blocks named by the chits so future polls can use them.
+	// Fetch unknown blocks named by the chits so the vote can be applied.
 	e.fetchIfUnknown(preferred)
 	if preferredAtHeight != preferred {
 		e.fetchIfUnknown(preferredAtHeight)
 	}
+	e.applyVote(parkedVote{
+		requestID: requestID,
+		nodeID:    nodeID,
+		options:   []ids.ID{preferred, preferredAtHeight},
+		deadline:  time.Now().Add(net.RequestTimeout),
+	}, true)
+}
 
-	// Bubble the vote to the nearest block consensus knows about; response
-	// options in decreasing-height order, first applicable wins (mirrors
-	// snow/engine/snowman voter.go).
-	var results []bag.Bag[ids.ID]
-	if vote, ok := e.bubble(preferred); ok {
-		results = e.polls.Vote(requestID, nodeID, vote)
-	} else if vote, ok := e.bubble(preferredAtHeight); ok {
-		results = e.polls.Vote(requestID, nodeID, vote)
-	} else {
-		results = e.polls.Drop(requestID, nodeID)
+// applyVote bubbles the vote to the nearest block consensus knows about
+// (response options in decreasing-height order, first applicable wins,
+// mirroring snow/engine/snowman voter.go). A vote blocked on an unknown
+// container is parked until the container arrives or the deadline passes.
+// A vote with no applicable option falls back to the peer's last known
+// accepted frontier (the engine's QueryFailed behavior); only then Drop.
+// Dropped and fallback votes can only fail a poll, never accept for it.
+func (e *Engine) applyVote(v parkedVote, allowPark bool) {
+	for i, opt := range v.options {
+		vote, blocker, ok := e.bubble(opt)
+		if ok {
+			e.recordPolls(e.polls.Vote(v.requestID, v.nodeID, vote))
+			return
+		}
+		if allowPark && i == 0 && blocker != ids.Empty {
+			// Park on the highest option's blocker; retried on arrival.
+			e.fetchIfUnknown(blocker)
+			e.parked[blocker] = append(e.parked[blocker], v)
+			return
+		}
 	}
-	e.recordPolls(results)
+	if fid, ok := e.frontiers[v.nodeID]; ok {
+		if vote, _, ok := e.bubble(fid); ok {
+			e.recordPolls(e.polls.Vote(v.requestID, v.nodeID, vote))
+			return
+		}
+	}
+	e.recordPolls(e.polls.Drop(v.requestID, v.nodeID))
 }
 
 func (e *Engine) OnAncestors(nodeID ids.NodeID, requestID uint32, containers [][]byte) {
@@ -334,16 +391,25 @@ func (e *Engine) Tick() {
 		}
 	case phaseLive:
 		e.expirePolls(now)
+		e.expireParked(now)
 		e.retryGets(now)
-		interval := e.cfg.IdlePollInterval
+		// Keep up to ConcurrentRepolls polls in flight while blocks are
+		// processing (like the engine's repoll); idle, poll for discovery.
 		if e.cons.NumProcessing() > 0 {
-			interval = e.cfg.PollInterval
-		}
-		if now.Sub(e.lastPollAt) >= interval {
+			for e.polls.Len() < e.cfg.Params.ConcurrentRepolls && now.Sub(e.lastPollAt) >= e.cfg.PollInterval {
+				if !e.sendPoll() {
+					break
+				}
+			}
+		} else if now.Sub(e.lastPollAt) >= e.cfg.IdlePollInterval {
 			e.sendPoll()
 		}
 		if !e.lastAcceptAt.IsZero() && now.Sub(e.lastAcceptAt) > 30*time.Second {
-			e.log.Warn("no block accepted recently", "since", now.Sub(e.lastAcceptAt), "processing", e.cons.NumProcessing())
+			e.log.Warn("no block accepted recently",
+				"since", now.Sub(e.lastAcceptAt),
+				"processing", e.cons.NumProcessing(),
+				"polls_ok", e.pollsOK, "polls_failed", e.pollsFailed,
+				"sampled_unconnected", e.sampledOff, "sampled_total", e.sampledAll)
 			e.lastAcceptAt = now // rate-limit the warning
 		}
 	}
@@ -564,6 +630,14 @@ func (e *Engine) addContainer(c *net.Container) {
 	r := &rec{c: c, ethHash: schema.Hash(c.Eth.Hash())}
 	e.recs[c.ID] = r
 	e.tryIssue(r)
+	// Votes parked on this container can bubble now (through it, even if it
+	// could not be issued yet).
+	if votes, ok := e.parked[c.ID]; ok {
+		delete(e.parked, c.ID)
+		for _, v := range votes {
+			e.applyVote(v, false)
+		}
+	}
 }
 
 // tryIssue executes the block once its parent is known and issued, then
@@ -641,7 +715,9 @@ func (e *Engine) fetchIfUnknown(id ids.ID) {
 		g = &getReq{}
 		e.gets[id] = g
 	}
-	g.deadline = time.Now().Add(net.RequestTimeout)
+	// Short retry deadline: an unanswered Get parks votes; re-ask another
+	// peer quickly instead of letting them expire.
+	g.deadline = time.Now().Add(2500 * time.Millisecond)
 	g.tries++
 	if err := e.cfg.Net.SendGet(peer, e.cfg.Net.NextRequestID(), id); err != nil {
 		e.log.Warn("get send failed", "err", err)
@@ -664,17 +740,17 @@ func (e *Engine) retryGets(now time.Time) {
 
 // --- live: polls ---
 
-func (e *Engine) sendPoll() {
+func (e *Engine) sendPoll() bool {
 	vdrs, err := e.cfg.Net.SampleValidators(e.cfg.Params.K)
 	if err != nil || len(vdrs) == 0 {
 		e.log.Warn("poll: cannot sample validators", "err", err)
-		return
+		return false
 	}
 	var vdrBag bag.Bag[ids.NodeID]
 	vdrBag.Add(vdrs...)
 	reqID := e.cfg.Net.NextRequestID()
 	if !e.polls.Add(reqID, vdrBag) {
-		return
+		return false
 	}
 	e.lastPollAt = time.Now()
 
@@ -687,19 +763,40 @@ func (e *Engine) sendPoll() {
 			disconnected = append(disconnected, v)
 		}
 	}
-	ps := &pollState{remaining: targets, deadline: time.Now().Add(net.RequestTimeout)}
+	e.sampledAll += uint64(len(vdrs))
+	e.sampledOff += uint64(len(disconnected))
+	ps := &pollState{remaining: targets, deadline: time.Now().Add(e.cfg.PollTimeout)}
 	if targets.Len() > 0 {
 		e.pollVdrs[reqID] = ps
 		if err := e.cfg.Net.SendPullQuery(targets, reqID, e.cons.Preference(), e.lastAcceptedHeight+1); err != nil {
 			e.log.Warn("poll: send failed", "err", err)
 		}
 	}
-	// Unconnected samples can never answer: drop immediately.
-	var results []bag.Bag[ids.ID]
+	// Unconnected samples can never answer: their last known frontier (if
+	// any) votes for them, else drop immediately.
 	for _, v := range disconnected {
-		results = append(results, e.polls.Drop(reqID, v)...)
+		e.applyVote(parkedVote{requestID: reqID, nodeID: v}, false)
 	}
-	e.recordPolls(results)
+	return true
+}
+
+func (e *Engine) expireParked(now time.Time) {
+	for id, votes := range e.parked {
+		kept := votes[:0]
+		for _, v := range votes {
+			if now.After(v.deadline) {
+				v.options = nil
+				e.applyVote(v, false) // frontier fallback, else drop
+			} else {
+				kept = append(kept, v)
+			}
+		}
+		if len(kept) == 0 {
+			delete(e.parked, id)
+		} else {
+			e.parked[id] = kept
+		}
+	}
 }
 
 func (e *Engine) expirePolls(now time.Time) {
@@ -708,25 +805,29 @@ func (e *Engine) expirePolls(now time.Time) {
 			continue
 		}
 		delete(e.pollVdrs, reqID)
-		var results []bag.Bag[ids.ID]
 		for _, v := range ps.remaining.List() {
-			results = append(results, e.polls.Drop(reqID, v)...)
+			// QueryFailed equivalent: the peer's last known accepted
+			// frontier votes in its stead, else drop.
+			e.applyVote(parkedVote{requestID: reqID, nodeID: v}, false)
 		}
-		e.recordPolls(results)
 	}
 }
 
 // bubble walks id up through known containers to the nearest one consensus
 // is processing (or the accepted frontier). ok=false when the walk dead-ends
-// at an unknown block.
-func (e *Engine) bubble(id ids.ID) (ids.ID, bool) {
+// at an unknown (or known-but-unissued) block, returned as blocker.
+func (e *Engine) bubble(id ids.ID) (vote ids.ID, blocker ids.ID, ok bool) {
 	for {
 		if id == e.lastAcceptedID || e.cons.Processing(id) {
-			return id, true
+			return id, ids.Empty, true
 		}
-		r, ok := e.recs[id]
-		if !ok {
-			return ids.Empty, false
+		r, exists := e.recs[id]
+		if !exists {
+			return ids.Empty, id, false
+		}
+		if r.c.Eth.NumberU64() <= e.lastAcceptedHeight {
+			// A stale fork below the accepted frontier: nothing to vote for.
+			return ids.Empty, ids.Empty, false
 		}
 		id = r.c.ParentID
 	}
@@ -734,6 +835,15 @@ func (e *Engine) bubble(id ids.ID) (ids.ID, bool) {
 
 func (e *Engine) recordPolls(results []bag.Bag[ids.ID]) {
 	for _, votes := range results {
+		// Poll health accounting: a poll whose top vote misses
+		// alphaPreference resets snowball confidence; chronic failures are
+		// the one way this follower falls behind, so track and report them.
+		_, topCount := votes.Mode()
+		if topCount >= e.cfg.Params.AlphaPreference {
+			e.pollsOK++
+		} else {
+			e.pollsFailed++
+		}
 		if err := e.cons.RecordPoll(context.Background(), votes); err != nil {
 			e.fail(fmt.Errorf("consensus: record poll: %w", err))
 			return
