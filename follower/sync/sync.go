@@ -50,6 +50,10 @@ type Config struct {
 
 const leafLimit = 1024 // server-side response cap
 
+// storageConcurrency is how many storage tries one segment worker resolves
+// in parallel within an account response (storage requests dominate).
+const storageConcurrency = 6
+
 type bundle struct {
 	seg   int
 	final bool
@@ -205,8 +209,26 @@ func (s *syncer) runSegment(ctx context.Context, seg int, start []byte) error {
 		if err != nil {
 			return fmt.Errorf("sync: segment %02x leafs at %x: %w", seg, start, err)
 		}
+		// Storage tries are fetched concurrently (they dominate the request
+		// count); slot bundles stream as they arrive, which is safe in any
+		// order. Only the account rows must commit ascending per segment
+		// (the resume watermark), so they are collected and enqueued in key
+		// order after the whole response resolved.
+		accountRows := make([]func(*store.Baseline) error, len(resp.Keys))
+		ag, agctx := errgroup.WithContext(ctx)
+		ag.SetLimit(storageConcurrency)
 		for i := range resp.Keys {
-			if err := s.handleAccount(ctx, seg, resp.Keys[i], resp.Vals[i]); err != nil {
+			ag.Go(func() error {
+				apply, err := s.handleAccount(agctx, seg, resp.Keys[i], resp.Vals[i])
+				accountRows[i] = apply
+				return err
+			})
+		}
+		if err := ag.Wait(); err != nil {
+			return err
+		}
+		for _, apply := range accountRows {
+			if err := s.enqueue(ctx, bundle{seg: seg, apply: apply}); err != nil {
 				return err
 			}
 		}
@@ -230,16 +252,17 @@ func (s *syncer) runSegment(ctx context.Context, seg int, start []byte) error {
 	return nil
 }
 
-// handleAccount fetches the account's storage and code and enqueues its rows:
-// storage bundles stream first, code (if this worker claimed the hash) and the
-// account row ride the last bundle.
-func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) error {
+// handleAccount fetches the account's storage and code. Slot bundles are
+// enqueued as they arrive (order-independent); the returned apply func is the
+// account row (plus a first-claim code row), which the caller enqueues in
+// ascending key order to keep the segment watermark sound.
+func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) (func(*store.Baseline) error, error) {
 	if len(key) != 32 {
-		return fmt.Errorf("sync: account leaf key has %d bytes", len(key))
+		return nil, fmt.Errorf("sync: account leaf key has %d bytes", len(key))
 	}
 	var acc types.StateAccount
 	if err := rlp.DecodeBytes(val, &acc); err != nil {
-		return fmt.Errorf("sync: account %x: %w", key, err)
+		return nil, fmt.Errorf("sync: account %x: %w", key, err)
 	}
 	addrHash := schema.Hash(common.BytesToHash(key))
 	row := schema.Account{Nonce: acc.Nonce, CodeHash: schema.Hash(common.BytesToHash(acc.CodeHash))}
@@ -247,29 +270,29 @@ func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) er
 		row.Balance = *acc.Balance
 	}
 
-	// Storage trie, streamed in response-sized bundles.
-	// ponytail: one worker per storage trie; parallel sub-ranges for giant
-	// contracts if a profile ever shows a long single-account tail.
+	// Storage trie, slot bundles streamed as fetched.
+	// ponytail: one fetcher per storage trie; split giant tries into parallel
+	// sub-ranges if a profile shows a single-account tail dominating.
 	if acc.Root != (common.Hash{}) && acc.Root != types.EmptyRootHash {
 		var start []byte
 		for {
 			req, err := message.NewLeafsRequest(message.CorethLeafsRequestType,
 				acc.Root, common.Hash(addrHash), start, nil, leafLimit, message.StateTrieNode)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			resp, err := s.cfg.Client.GetLeafs(ctx, req)
 			if err != nil {
-				return fmt.Errorf("sync: storage of %x: %w", addrHash, err)
+				return nil, fmt.Errorf("sync: storage of %x: %w", addrHash, err)
 			}
 			slots := make([][2]schema.Hash, 0, len(resp.Keys))
 			for i := range resp.Keys {
 				if len(resp.Keys[i]) != 32 {
-					return fmt.Errorf("sync: storage leaf key has %d bytes", len(resp.Keys[i]))
+					return nil, fmt.Errorf("sync: storage leaf key has %d bytes", len(resp.Keys[i]))
 				}
 				_, content, _, err := rlp.Split(resp.Vals[i])
 				if err != nil || len(content) > 32 {
-					return fmt.Errorf("sync: storage value of %x: %v", addrHash, err)
+					return nil, fmt.Errorf("sync: storage value of %x: %v", addrHash, err)
 				}
 				var v schema.Hash
 				copy(v[32-len(content):], content)
@@ -284,7 +307,7 @@ func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) er
 				}
 				return nil
 			}}); err != nil {
-				return err
+				return nil, err
 			}
 			if len(resp.Keys) == 0 || !resp.More {
 				break
@@ -303,7 +326,7 @@ func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) er
 		if _, claimed := s.codeClaims.LoadOrStore(codeHash, struct{}{}); !claimed {
 			blobs, err := s.cfg.Client.GetCode(ctx, []common.Hash{codeHash})
 			if err != nil {
-				return fmt.Errorf("sync: code %x: %w", codeHash, err)
+				return nil, fmt.Errorf("sync: code %x: %w", codeHash, err)
 			}
 			code = blobs[0]
 			s.codes.Add(1)
@@ -311,14 +334,14 @@ func (s *syncer) handleAccount(ctx context.Context, seg int, key, val []byte) er
 	}
 
 	s.accounts.Add(1)
-	return s.enqueue(ctx, bundle{seg: seg, apply: func(bl *store.Baseline) error {
+	return func(bl *store.Baseline) error {
 		if code != nil {
 			if err := bl.Code(schema.Hash(codeHash), code); err != nil {
 				return err
 			}
 		}
 		return bl.BaseAccount(addrHash, &row)
-	}})
+	}, nil
 }
 
 func (s *syncer) enqueue(ctx context.Context, b bundle) error {
