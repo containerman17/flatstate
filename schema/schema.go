@@ -19,6 +19,10 @@ const (
 	PrefDiff     byte = 0x04 // 0x04 | block(8) -> per-block diff (capture batch verbatim)
 	PrefMempool  byte = 0x05 // 0x05 | seq(8) -> arrival time(8) + tx bytes
 	PrefCode     byte = 0x06 // 0x06 | code hash(32) -> contract code
+	// Hash-keyed snapshot baseline at S (D6 rev 2). Probed once per cold key
+	// after a preimage-history miss; one keccak, off the steady-state path.
+	PrefBaseAccount byte = 0x07 // 0x07 | keccak(addr)(32) -> account post-image at S
+	PrefBaseSlot    byte = 0x08 // 0x08 | keccak(addr)(32) | keccak(slot)(32) -> slot value at S
 )
 
 // Meta keys (prefix 0x00).
@@ -30,12 +34,14 @@ var (
 
 // Key lengths.
 const (
-	AccountKeyLen  = 1 + 20 + 8
-	SlotKeyLen     = 1 + 20 + 32 + 8
-	DestructKeyLen = 1 + 20 + 8
-	DiffKeyLen     = 1 + 8
-	MempoolKeyLen  = 1 + 8
-	CodeKeyLen     = 1 + 32
+	AccountKeyLen     = 1 + 20 + 8
+	SlotKeyLen        = 1 + 20 + 32 + 8
+	DestructKeyLen    = 1 + 20 + 8
+	DiffKeyLen        = 1 + 8
+	MempoolKeyLen     = 1 + 8
+	CodeKeyLen        = 1 + 32
+	BaseAccountKeyLen = 1 + 32
+	BaseSlotKeyLen    = 1 + 32 + 32
 )
 
 type (
@@ -125,4 +131,17 @@ func AppendMempoolKey(dst []byte, seq uint64) []byte {
 func AppendCodeKey(dst []byte, hash Hash) []byte {
 	dst = append(dst, PrefCode)
 	return append(dst, hash[:]...)
+}
+
+// Baseline keys take the ALREADY-HASHED keccak(addr) / keccak(slot); the
+// store computes the hashes so callers stay preimage-only.
+func AppendBaseAccountKey(dst []byte, addrHash Hash) []byte {
+	dst = append(dst, PrefBaseAccount)
+	return append(dst, addrHash[:]...)
+}
+
+func AppendBaseSlotKey(dst []byte, addrHash Hash, slotHash Hash) []byte {
+	dst = append(dst, PrefBaseSlot)
+	dst = append(dst, addrHash[:]...)
+	return append(dst, slotHash[:]...)
 }

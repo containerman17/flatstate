@@ -6,10 +6,20 @@ import (
 	"math"
 
 	"github.com/PowerDNS/lmdb-go/lmdb"
+	"golang.org/x/crypto/sha3"
 
 	"github.com/containerman17/flatstate/capture"
 	"github.com/containerman17/flatstate/schema"
 )
+
+// Keccak hashes a preimage for a 0x07/0x08 baseline probe (the one keccak a
+// cold key ever costs, D6 rev 2).
+func Keccak(b []byte) (h schema.Hash) {
+	k := sha3.NewLegacyKeccak256()
+	k.Write(b)
+	k.Sum(h[:0])
+	return h
+}
 
 // Latest reads the newest committed value (tip pin-on-miss path, D8).
 const Latest = uint64(math.MaxUint64)
@@ -94,10 +104,35 @@ func (d *DB) GetAccount(addr schema.Address, at uint64) (acct schema.Account, ex
 			// one block (destruct marker only): does not exist.
 			return nil
 		default:
+			// D6 rev 2 read order step 2: no preimage history row, probe the
+			// hash-keyed baseline at S. Valid for any at >= S: a later change
+			// would have left a history row.
+			raw, bok, err := getBaseRow(txn, d.dbi, schema.AppendBaseAccountKey(kbuf[:0], Keccak(addr[:])))
+			if err != nil {
+				return err
+			}
+			if bok {
+				acct, err = schema.DecodeAccount(raw)
+				exists = err == nil
+				return err
+			}
+			// Step 3: known zero, if the baseline is complete.
 			return d.missAllowed()
 		}
 	})
 	return
+}
+
+// getBaseRow reads one 0x07/0x08 baseline row. ok=false on absence.
+func getBaseRow(txn *lmdb.Txn, dbi lmdb.DBI, key []byte) ([]byte, bool, error) {
+	v, err := txn.Get(dbi, key)
+	if lmdb.IsNotFound(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return v, true, nil
 }
 
 // GetSlot returns the slot value at the greatest write at or before block at.
@@ -125,11 +160,24 @@ func (d *DB) GetSlot(addr schema.Address, slot schema.Hash, at uint64) (val sche
 		}
 		if !found {
 			// No write at or before at. Zero if the account was destructed
-			// at or before at, or if the baseline is complete (key covered,
-			// so absence means the slot was always zero).
+			// at or before at (destruct wiped pre-S storage too).
 			if dfound {
 				return nil
 			}
+			// D6 rev 2 step 2: hash-keyed baseline probe.
+			raw, bok, err := getBaseRow(txn, d.dbi,
+				schema.AppendBaseSlotKey(kbuf[:0], Keccak(addr[:]), Keccak(slot[:])))
+			if err != nil {
+				return err
+			}
+			if bok {
+				if len(raw) != 32 {
+					return fmt.Errorf("store: baseline slot row has %d bytes, want 32", len(raw))
+				}
+				copy(val[:], raw)
+				return nil
+			}
+			// Step 3: known zero, if the baseline is complete.
 			return d.missAllowed()
 		}
 		if dfound && dh > h {

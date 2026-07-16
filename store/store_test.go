@@ -331,3 +331,86 @@ func BenchmarkGetAccount(b *testing.B) {
 		}
 	}
 }
+
+// TestHashBaselineReadOrder covers the D6 rev 2 three-step read path:
+// (1) preimage history rows win, (2) on miss probe the hash-keyed 0x07/0x08
+// baseline, (3) still nothing = known zero once baseline_complete is set.
+func TestHashBaselineReadOrder(t *testing.T) {
+	d, err := Open(t.TempDir(), testMapSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	bl, err := d.NewBaseline(100) // sets genesis S=100
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hash-keyed baseline: addrA (with slot s1=0x11), addrB.
+	aA := acct(7, 3, ch)
+	if err := d.PutBaseAccount(Keccak(addrA[:]), &aA); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutBaseSlot(Keccak(addrA[:]), Keccak(s1[:]), h(0x11)); err != nil {
+		t.Fatal(err)
+	}
+	aB := acct(9, 0, schema.Hash{})
+	if err := d.PutBaseAccount(Keccak(addrB[:]), &aB); err != nil {
+		t.Fatal(err)
+	}
+
+	// Baseline incomplete: uncovered keys fail loud, covered keys are served.
+	if got, exists, err := d.GetAccount(addrA, 100); err != nil || !exists || got.Nonce != 3 {
+		t.Fatalf("baseline account probe: %v exists=%v got=%+v", err, exists, got)
+	}
+	if v, err := d.GetSlot(addrA, s1, 105); err != nil || v != h(0x11) {
+		t.Fatalf("baseline slot probe: %v %x", err, v)
+	}
+	if _, _, err := d.GetAccount(addrC, 100); !errors.Is(err, ErrBaselineIncomplete) {
+		t.Fatalf("uncovered account should fail loud, got %v", err)
+	}
+	if _, err := d.GetSlot(addrA, s2, 100); !errors.Is(err, ErrBaselineIncomplete) {
+		t.Fatalf("uncovered slot should fail loud, got %v", err)
+	}
+	if err := bl.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 3: known zero after completion.
+	if _, exists, err := d.GetAccount(addrC, 100); err != nil || exists {
+		t.Fatalf("absent account after complete: %v exists=%v", err, exists)
+	}
+	if v, err := d.GetSlot(addrA, s2, 100); err != nil || v != (schema.Hash{}) {
+		t.Fatalf("absent slot after complete: %v %x", err, v)
+	}
+
+	// Step 1 beats step 2: a preimage history row at 101 overrides baseline.
+	b := &capture.Batch{Block: 101, Hash: h(1), Parent: h(0), Ops: []capture.Op{
+		{Kind: capture.OpSlot, Addr: addrA, Slot: s1, Value: h(0x22)},
+		{Kind: capture.OpAccount, Addr: addrB, Account: acct(1, 1, schema.Hash{})},
+	}}
+	if err := d.WriteBlock(b); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := d.GetSlot(addrA, s1, 101); err != nil || v != h(0x22) {
+		t.Fatalf("history row should win: %v %x", err, v)
+	}
+	if got, _, err := d.GetAccount(addrB, 101); err != nil || got.Nonce != 1 {
+		t.Fatalf("history account should win: %v %+v", err, got)
+	}
+	// Reads below the write still see the baseline.
+	if v, err := d.GetSlot(addrA, s1, 100); err != nil || v != h(0x11) {
+		t.Fatalf("pre-write read should hit baseline: %v %x", err, v)
+	}
+
+	// Destruct after S hides the baseline (no probe on destructed accounts).
+	db2 := &capture.Batch{Block: 102, Hash: h(2), Parent: h(1), Ops: []capture.Op{
+		{Kind: capture.OpDestruct, Addr: addrB},
+	}}
+	if err := d.WriteBlock(db2); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err := d.GetAccount(addrB, 102); err != nil || exists {
+		t.Fatalf("destructed account must not resurrect from baseline: %v exists=%v", err, exists)
+	}
+}

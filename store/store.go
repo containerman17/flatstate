@@ -304,6 +304,29 @@ func (bl *Baseline) Code(hash schema.Hash, code []byte) error {
 	return bl.add(schema.AppendCodeKey(nil, hash), bytes.Clone(code))
 }
 
+// --- hash-keyed baseline rows (D6 rev 2, 0x07/0x08) ---
+//
+// The snapshot baseline at S is keyed by keccak(addr)/keccak(slot) because no
+// preimage-keyed full-state enumeration exists anywhere. These puts take the
+// ALREADY-HASHED keys: the loader's source (state-sync artifact / node
+// snapshot) only has hashed keys. The loader itself is a later phase; it must
+// end by calling Finish on a Baseline (or setting MetaBaselineComplete) so
+// reads stop failing loud.
+
+// PutBaseAccount writes one 0x07 baseline account row under keccak(addr).
+func (d *DB) PutBaseAccount(addrHash schema.Hash, a *schema.Account) error {
+	return d.env.Update(func(txn *lmdb.Txn) error {
+		return txn.Put(d.dbi, schema.AppendBaseAccountKey(nil, addrHash), schema.EncodeAccount(nil, a), 0)
+	})
+}
+
+// PutBaseSlot writes one 0x08 baseline slot row under keccak(addr)||keccak(slot).
+func (d *DB) PutBaseSlot(addrHash, slotHash schema.Hash, val schema.Hash) error {
+	return d.env.Update(func(txn *lmdb.Txn) error {
+		return txn.Put(d.dbi, schema.AppendBaseSlotKey(nil, addrHash, slotHash), val[:], 0)
+	})
+}
+
 // Finish flushes and sets the baseline_complete watermark.
 func (bl *Baseline) Finish() error {
 	if err := bl.flush(); err != nil {
