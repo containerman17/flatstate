@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -55,13 +56,14 @@ func main() {
 
 func run() error {
 	var (
-		dbPath   = flag.String("db", "", "flatstate LMDB env path (created if needed)")
-		mapGB    = flag.Int64("map-size-gb", 200, "LMDB map size in GiB")
-		nodeURI  = flag.String("node-uri", fnet.DefaultNodeURI, "public node for bootstrap RPC")
-		workers  = flag.Int("workers", 32, "concurrent leaf-range fetchers")
-		inflight = flag.Int("inflight", 1536, "global cap on outstanding leaf/code requests")
-		perPeer  = flag.Int("per-peer", 6, "outstanding request cap per peer")
-		height   = flag.Uint64("height", 0, "pivot height S (0 = latest summary boundary)")
+		dbPath     = flag.String("db", "", "flatstate LMDB env path (created if needed)")
+		mapGB      = flag.Int64("map-size-gb", 200, "LMDB map size in GiB")
+		nodeURI    = flag.String("node-uri", fnet.DefaultNodeURI, "public node for bootstrap RPC")
+		workers    = flag.Int("workers", 32, "concurrent leaf-range fetchers")
+		inflight   = flag.Int("inflight", 1536, "global cap on outstanding leaf/code requests")
+		perPeer    = flag.Int("per-peer", 6, "outstanding request cap per peer")
+		identities = flag.Int("identities", 1, "p2p identities to dial (peers throttle per node ID)")
+		height     = flag.Uint64("height", 0, "pivot height S (0 = latest summary boundary)")
 	)
 	flag.Parse()
 	if *dbPath == "" {
@@ -106,38 +108,71 @@ func run() error {
 
 	fnet.RegisterExtras() // account RLP carries the coreth multicoin extra
 
-	var nc *fsync.NetClient
-	network, err := fnet.Dial(ctx, fnet.Config{
-		NodeURI: *nodeURI,
-		Callbacks: fnet.Callbacks{
-			AppResponse: func(nodeID ids.NodeID, requestID uint32, response []byte, failed bool) {
-				if nc != nil {
-					nc.OnAppResponse(nodeID, requestID, response, failed)
-				}
+	// Peers throttle inbound work PER NODE ID with a slow refill; one
+	// identity decays to the aggregate refill rate within minutes. Dialing
+	// K identities (fresh ephemeral cert each) multiplies the budget.
+	mux := &muxClient{timeouts: make([]func() uint64, 0, *identities)}
+	for i := range *identities {
+		var nc *fsync.NetClient
+		network, err := fnet.Dial(ctx, fnet.Config{
+			NodeURI: *nodeURI,
+			Callbacks: fnet.Callbacks{
+				AppResponse: func(nodeID ids.NodeID, requestID uint32, response []byte, failed bool) {
+					if nc != nil {
+						nc.OnAppResponse(nodeID, requestID, response, failed)
+					}
+				},
 			},
-		},
-		Log: log,
-	})
-	if err != nil {
-		return fmt.Errorf("net: %w", err)
+			Log: log.With("identity", i),
+		})
+		if err != nil {
+			return fmt.Errorf("net (identity %d): %w", i, err)
+		}
+		defer network.Close()
+		nc = fsync.NewNetClient(network, *inflight / *identities, *perPeer)
+		mux.timeouts = append(mux.timeouts, nc.Timeouts)
+		mux.clients = append(mux.clients, syncclient.New(&syncclient.Config{
+			Network: nc,
+			Codec:   message.CorethCodec,
+			Stats:   stats.NewNoOpStats(),
+		}))
 	}
-	defer network.Close()
-	nc = fsync.NewNetClient(network, *inflight, *perPeer)
-
-	client := syncclient.New(&syncclient.Config{
-		Network: nc,
-		Codec:   message.CorethCodec,
-		Stats:   stats.NewNoOpStats(),
-	})
 	return fsync.Run(ctx, fsync.Config{
-		Client:   client,
+		Client:   mux,
 		DB:       db,
 		Height:   s,
 		Root:     root,
 		Workers:  *workers,
 		Log:      log,
-		Timeouts: nc.Timeouts,
+		Timeouts: mux.Timeouts,
 	})
+}
+
+// muxClient round-robins sync requests over the per-identity clients.
+type muxClient struct {
+	clients  []fsync.Client
+	timeouts []func() uint64
+	ctr      atomic.Uint64
+}
+
+func (m *muxClient) pick() fsync.Client {
+	return m.clients[m.ctr.Add(1)%uint64(len(m.clients))]
+}
+
+func (m *muxClient) GetLeafs(ctx context.Context, req message.LeafsRequest) (message.LeafsResponse, error) {
+	return m.pick().GetLeafs(ctx, req)
+}
+
+func (m *muxClient) GetCode(ctx context.Context, hashes []common.Hash) ([][]byte, error) {
+	return m.pick().GetCode(ctx, hashes)
+}
+
+func (m *muxClient) Timeouts() uint64 {
+	var t uint64
+	for _, f := range m.timeouts {
+		t += f()
+	}
+	return t
 }
 
 // --- minimal C-chain JSON-RPC (stdlib only) ---
