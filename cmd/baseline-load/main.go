@@ -1,44 +1,50 @@
 // Command baseline-load fills the flatstate hash-keyed snapshot baseline
-// (0x07 accounts, 0x08 slots) and 0x06 code rows from a STOPPED avalanchego
-// node's PebbleDB (see docs/baseline-loader.md). The node must have synced
-// the C-chain with the default hash state scheme, so its geth snapshot disk
-// layer is a consistent full state at the last accepted height S (coreth
-// flattens the snapshot on every accept). S is recovered by matching header
-// roots below the acceptor tip against the snapshot root marker; no match
-// aborts loudly.
+// (0x07 accounts, 0x08 slots) and 0x06 code rows by acting as a C-chain
+// state-sync CLIENT over mainnet p2p (docs/baseline-loader.md). No node runs
+// anywhere: leaf ranges come from peers as AppRequest/AppResponse and are
+// verified as merkle range proofs against the state root of the pivot block
+// S by the reused coreth sync client.
 //
-// Resumable: a progress cursor (phase + last source key) is committed with
-// the row chunks; on restart the source iterator seeks back to it and the
-// boundary chunk is rewritten idempotently.
+// S defaults to the most recent state-sync summary height (a multiple of the
+// coreth StateSyncCommitInterval, which peers retain and serve); its state
+// root is fetched from the public RPC. Resumable: rerunning after a kill
+// continues from the per-segment watermarks.
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
-	"github.com/ava-labs/avalanchego/database/pebbledb"
-	"github.com/ava-labs/avalanchego/database/prefixdb"
+	"github.com/ava-labs/avalanchego/graft/evm/message"
+	syncclient "github.com/ava-labs/avalanchego/graft/evm/sync/client"
+	"github.com/ava-labs/avalanchego/graft/evm/sync/client/stats"
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/utils/logging"
-	evmdb "github.com/ava-labs/avalanchego/vms/evm/database"
-	"github.com/ava-labs/avalanchego/vms/evm/sync/customrawdb"
 	"github.com/ava-labs/libevm/common"
-	"github.com/ava-labs/libevm/core/rawdb"
-	"github.com/ava-labs/libevm/core/types"
-	"github.com/ava-labs/libevm/ethdb"
-	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/containerman17/flatstate/follower/net"
-	"github.com/containerman17/flatstate/schema"
+	fnet "github.com/containerman17/flatstate/follower/net"
+	fsync "github.com/containerman17/flatstate/follower/sync"
 	"github.com/containerman17/flatstate/store"
 )
 
-// cChainID is the mainnet C-chain blockchain ID.
-const cChainID = "2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5"
+// summaryInterval is coreth's StateSyncCommitInterval: every peer retains and
+// serves the state at these heights.
+const summaryInterval = 16384
+
+// summaryMargin keeps S at least this far below head so the newest boundary
+// has been committed and its summary registered on effectively every peer.
+const summaryMargin = 256
 
 func main() {
 	if err := run(); err != nil {
@@ -49,194 +55,147 @@ func main() {
 
 func run() error {
 	var (
-		nodeDB     = flag.String("node-db", "", "pebble directory of the STOPPED node (…/db/mainnet/…)")
-		dbPath     = flag.String("db", "", "flatstate LMDB env path (created if needed)")
-		mapGB      = flag.Int64("map-size-gb", 200, "LMDB map size in GiB")
-		chainIDStr = flag.String("chain-id", cChainID, "C-chain blockchain ID")
+		dbPath  = flag.String("db", "", "flatstate LMDB env path (created if needed)")
+		mapGB   = flag.Int64("map-size-gb", 200, "LMDB map size in GiB")
+		nodeURI = flag.String("node-uri", fnet.DefaultNodeURI, "public node for bootstrap RPC")
+		workers = flag.Int("workers", 32, "concurrent leaf-range fetchers")
+		height  = flag.Uint64("height", 0, "pivot height S (0 = latest summary boundary)")
 	)
 	flag.Parse()
-	if *nodeDB == "" || *dbPath == "" {
-		return errors.New("-node-db and -db are required")
+	if *dbPath == "" {
+		return errors.New("-db is required")
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	slog.SetDefault(log)
 
-	// Account RLP carries the coreth multicoin extra payload; decoding
-	// without the graft extras registered misparses it.
-	net.RegisterExtras()
-
-	raw, err := pebbledb.New(*nodeDB, nil, logging.NoLog{}, nil)
-	if err != nil {
-		return fmt.Errorf("open node db (is the node stopped?): %w", err)
-	}
-	defer raw.Close()
-	chainID, err := ids.FromString(*chainIDStr)
-	if err != nil {
-		return fmt.Errorf("chain-id: %w", err)
-	}
-	// Replicate the node's exact prefix stack: chains/manager.go
-	// (chainID, then "vm") + coreth vm_database.go ("ethdb", nested).
-	vmDB := prefixdb.New([]byte("vm"), prefixdb.New(chainID[:], raw))
-	chaindb := rawdb.NewDatabase(evmdb.New(prefixdb.NewNested([]byte("ethdb"), vmDB)))
-
-	s, hash, err := findPivot(chaindb)
-	if err != nil {
-		return err
-	}
-	log.Info("baseline pivot", "height", s, "hash", hash)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	db, err := store.Open(*dbPath, *mapGB<<30)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	return load(db, chaindb, s, log)
-}
 
-// findPivot returns the height S whose state the snapshot disk layer holds:
-// the block at or below the acceptor tip whose header root equals the
-// snapshot root marker.
-func findPivot(chaindb ethdb.Database) (uint64, common.Hash, error) {
-	snapRoot := rawdb.ReadSnapshotRoot(chaindb)
-	if snapRoot == (common.Hash{}) {
-		return 0, common.Hash{}, errors.New("no snapshot root marker: snapshot missing or sync unfinished")
-	}
-	tip, err := customrawdb.ReadAcceptorTip(chaindb)
-	if err != nil {
-		return 0, common.Hash{}, err
-	}
-	if tip == (common.Hash{}) {
-		return 0, common.Hash{}, errors.New("no acceptor tip marker")
-	}
-	hash := tip
-	for range 1024 {
-		num := rawdb.ReadHeaderNumber(chaindb, hash)
-		if num == nil {
-			return 0, common.Hash{}, fmt.Errorf("no header number for %x", hash)
-		}
-		h := rawdb.ReadHeader(chaindb, hash, *num)
-		if h == nil {
-			return 0, common.Hash{}, fmt.Errorf("no header %d %x", *num, hash)
-		}
-		if h.Root == snapRoot {
-			return *num, hash, nil
-		}
-		hash = h.ParentHash
-	}
-	return 0, common.Hash{}, fmt.Errorf("no header within 1024 below the acceptor tip matches snapshot root %x", snapRoot)
-}
-
-// load drains the snapshot key ranges into the baseline and finishes it.
-func load(db *store.DB, chaindb ethdb.Database, s uint64, log *slog.Logger) error {
-	bl, err := db.NewBaseline(s)
-	if err != nil {
+	// Pivot: a resumed store dictates S; otherwise the flag or the latest
+	// summary boundary.
+	s := *height
+	if g, ok, err := db.Genesis(); err != nil {
 		return err
-	}
-	prog, _, err := db.BaselineProgress()
-	if err != nil {
-		return err
-	}
-	return loadFrom(bl, chaindb, prog, log)
-}
-
-type phaseDef struct {
-	id     byte
-	name   string
-	prefix []byte
-	keyLen int // exact physical key length; other lengths are foreign rows
-	put    func(bl *store.Baseline, key, val []byte) error
-}
-
-var phases = []phaseDef{
-	{1, "accounts", rawdb.SnapshotAccountPrefix, 33, putAccount},
-	{2, "slots", rawdb.SnapshotStoragePrefix, 65, putSlot},
-	{3, "code", rawdb.CodePrefix, 33, putCode},
-}
-
-const progressEvery = 1 << 18
-
-func loadFrom(bl *store.Baseline, chaindb ethdb.Database, prog []byte, log *slog.Logger) error {
-	resumePhase := byte(1)
-	var resumeKey []byte
-	if len(prog) >= 1 {
-		resumePhase = prog[0]
-		resumeKey = prog[1:]
-		log.Info("resuming", "phase", resumePhase, "key", fmt.Sprintf("%x", resumeKey))
-	}
-	for _, ph := range phases {
-		if ph.id < resumePhase {
-			continue
+	} else if ok {
+		if s != 0 && s != g {
+			return fmt.Errorf("store already has genesis %d, cannot load at %d", g, s)
 		}
-		var start []byte
-		if ph.id == resumePhase && len(resumeKey) > len(ph.prefix) {
-			start = resumeKey[len(ph.prefix):]
-		}
-		if err := runPhase(bl, chaindb, ph, start, log); err != nil {
+		s = g
+		log.Info("resuming existing baseline", "height", s)
+	} else if s == 0 {
+		head, err := rpcBlockNumber(ctx, *nodeURI)
+		if err != nil {
 			return err
 		}
+		s = (head - summaryMargin) / summaryInterval * summaryInterval
+		log.Info("pivot selected", "head", head, "height", s)
 	}
-	return bl.Finish()
-}
-
-func runPhase(bl *store.Baseline, chaindb ethdb.Database, ph phaseDef, start []byte, log *slog.Logger) error {
-	it := chaindb.NewIterator(ph.prefix, start)
-	defer it.Release()
-	t0 := time.Now()
-	var n uint64
-	for it.Next() {
-		key := it.Key()
-		if len(key) != ph.keyLen {
-			continue
-		}
-		if err := ph.put(bl, key, it.Value()); err != nil {
-			return fmt.Errorf("%s row %x: %w", ph.name, key, err)
-		}
-		n++
-		if n%progressEvery == 0 {
-			bl.SetProgress(append([]byte{ph.id}, key...))
-		}
-		if n%(1<<22) == 0 {
-			log.Info("phase progress", "phase", ph.name, "rows", n,
-				"rows_per_sec", uint64(float64(n)/time.Since(t0).Seconds()))
-		}
-	}
-	if err := it.Error(); err != nil {
-		return fmt.Errorf("%s iterator: %w", ph.name, err)
-	}
-	// Phase complete: park the cursor at the next phase and make it durable.
-	bl.SetProgress([]byte{ph.id + 1})
-	if err := bl.Flush(); err != nil {
-		return err
-	}
-	log.Info("phase done", "phase", ph.name, "rows", n, "elapsed", time.Since(t0).Round(time.Second).String())
-	return nil
-}
-
-func putAccount(bl *store.Baseline, key, val []byte) error {
-	acc, err := types.FullAccount(val)
+	root, hash, err := rpcStateRoot(ctx, *nodeURI, s)
 	if err != nil {
 		return err
 	}
-	a := schema.Account{Nonce: acc.Nonce, CodeHash: schema.Hash(common.BytesToHash(acc.CodeHash))}
-	if acc.Balance != nil {
-		a.Balance = *acc.Balance
-	}
-	return bl.BaseAccount(schema.Hash(key[1:33]), &a)
-}
+	log.Info("pivot block", "height", s, "hash", hash, "root", root)
 
-func putSlot(bl *store.Baseline, key, val []byte) error {
-	// Snapshot storage values are the RLP-encoded trimmed big-endian value.
-	_, content, _, err := rlp.Split(val)
+	fnet.RegisterExtras() // account RLP carries the coreth multicoin extra
+
+	var nc *fsync.NetClient
+	network, err := fnet.Dial(ctx, fnet.Config{
+		NodeURI: *nodeURI,
+		Callbacks: fnet.Callbacks{
+			AppResponse: func(nodeID ids.NodeID, requestID uint32, response []byte, failed bool) {
+				if nc != nil {
+					nc.OnAppResponse(nodeID, requestID, response, failed)
+				}
+			},
+		},
+		Log: log,
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("net: %w", err)
 	}
-	if len(content) > 32 {
-		return fmt.Errorf("slot value %d bytes after RLP, want <= 32", len(content))
-	}
-	var v schema.Hash
-	copy(v[32-len(content):], content)
-	return bl.BaseSlot(schema.Hash(key[1:33]), schema.Hash(key[33:65]), v)
+	defer network.Close()
+	nc = fsync.NewNetClient(network)
+
+	client := syncclient.New(&syncclient.Config{
+		Network: nc,
+		Codec:   message.CorethCodec,
+		Stats:   stats.NewNoOpStats(),
+	})
+	return fsync.Run(ctx, fsync.Config{
+		Client:  client,
+		DB:      db,
+		Height:  s,
+		Root:    root,
+		Workers: *workers,
+		Log:     log,
+	})
 }
 
-func putCode(bl *store.Baseline, key, val []byte) error {
-	return bl.Code(schema.Hash(key[1:33]), val)
+// --- minimal C-chain JSON-RPC (stdlib only) ---
+
+func rpcCall(ctx context.Context, nodeURI, method string, params ...any) (json.RawMessage, error) {
+	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+	if err != nil {
+		return nil, err
+	}
+	url := strings.TrimSuffix(nodeURI, "/") + "/ext/bc/C/rpc"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("%s: %w", method, err)
+	}
+	if out.Error != nil {
+		return nil, fmt.Errorf("%s: %s", method, out.Error.Message)
+	}
+	return out.Result, nil
+}
+
+func rpcBlockNumber(ctx context.Context, nodeURI string) (uint64, error) {
+	raw, err := rpcCall(ctx, nodeURI, "eth_blockNumber")
+	if err != nil {
+		return 0, err
+	}
+	var hexNum string
+	if err := json.Unmarshal(raw, &hexNum); err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(strings.TrimPrefix(hexNum, "0x"), 16, 64)
+}
+
+func rpcStateRoot(ctx context.Context, nodeURI string, height uint64) (root, hash common.Hash, err error) {
+	raw, err := rpcCall(ctx, nodeURI, "eth_getBlockByNumber", fmt.Sprintf("0x%x", height), false)
+	if err != nil {
+		return common.Hash{}, common.Hash{}, err
+	}
+	var blk struct {
+		StateRoot string `json:"stateRoot"`
+		Hash      string `json:"hash"`
+	}
+	if err := json.Unmarshal(raw, &blk); err != nil {
+		return common.Hash{}, common.Hash{}, err
+	}
+	if blk.StateRoot == "" {
+		return common.Hash{}, common.Hash{}, fmt.Errorf("block %d has no stateRoot (missing block?)", height)
+	}
+	return common.HexToHash(blk.StateRoot), common.HexToHash(blk.Hash), nil
 }

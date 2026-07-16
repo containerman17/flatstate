@@ -22,6 +22,9 @@ type Callbacks struct {
 	Chits func(nodeID ids.NodeID, requestID uint32, preferred, preferredAtHeight, accepted ids.ID, acceptedHeight uint64)
 	// Ancestors delivers a GetAncestors response (containers newest first).
 	Ancestors func(nodeID ids.NodeID, requestID uint32, containers [][]byte)
+	// AppResponse delivers an AppResponse, or an AppError with failed=true
+	// (response is nil then).
+	AppResponse func(nodeID ids.NodeID, requestID uint32, response []byte, failed bool)
 }
 
 type handler struct {
@@ -106,6 +109,16 @@ func (h *handler) HandleInbound(_ context.Context, msg *message.InboundMessage) 
 		p, ok := msg.Message.(*p2p.Ancestors)
 		if ok && h.cb.Ancestors != nil {
 			h.cb.Ancestors(msg.NodeID, p.RequestId, p.Containers)
+		}
+	case message.AppResponseOp:
+		p, ok := msg.Message.(*p2p.AppResponse)
+		if ok && h.cb.AppResponse != nil {
+			h.cb.AppResponse(msg.NodeID, p.RequestId, p.AppBytes, false)
+		}
+	case message.AppErrorOp:
+		p, ok := msg.Message.(*p2p.AppError)
+		if ok && h.cb.AppResponse != nil {
+			h.cb.AppResponse(msg.NodeID, p.RequestId, nil, true)
 		}
 	}
 }

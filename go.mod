@@ -6,11 +6,13 @@ require (
 	github.com/PowerDNS/lmdb-go v1.9.3
 	github.com/ava-labs/avalanchego v1.14.2
 	github.com/ava-labs/avalanchego/graft/coreth v1.14.2
+	github.com/ava-labs/avalanchego/graft/evm v1.14.2
 	github.com/ava-labs/libevm v1.13.14-0.4.0.rc.2
 	github.com/gorilla/websocket v1.5.0
 	github.com/holiman/uint256 v1.3.2
 	github.com/prometheus/client_golang v1.23.0
 	golang.org/x/crypto v0.54.0
+	golang.org/x/sync v0.22.0
 )
 
 require (
@@ -20,7 +22,6 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/StephenButtolph/canoto v0.18.0 // indirect
 	github.com/VictoriaMetrics/fastcache v1.12.1 // indirect
-	github.com/ava-labs/avalanchego/graft/evm v1.14.2 // indirect
 	github.com/ava-labs/firewood-go-ethhash/ffi v0.3.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
@@ -90,7 +91,6 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/exp v0.0.0-20241215155358-4a5509556b9e // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.40.0 // indirect

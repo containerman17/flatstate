@@ -222,6 +222,91 @@ func (d *DB) GetCode(hash schema.Hash) (code []byte, err error) {
 	return
 }
 
+// MaxBaseAccountWithPrefix returns the greatest 0x07 baseline account hash
+// whose first byte is p. Loader resume: baseline rows commit in ascending
+// order per segment, so this is the segment's durable watermark.
+func (d *DB) MaxBaseAccountWithPrefix(p byte) (h schema.Hash, ok bool, err error) {
+	err = d.env.View(func(txn *lmdb.Txn) error {
+		txn.RawRead = true
+		cur, err := txn.OpenCursor(d.dbi)
+		if err != nil {
+			return err
+		}
+		defer cur.Close()
+		seek := make([]byte, 33)
+		seek[0] = schema.PrefBaseAccount
+		seek[1] = p
+		for i := 2; i < len(seek); i++ {
+			seek[i] = 0xff
+		}
+		k, _, err := cur.Get(seek, nil, lmdb.SetRange)
+		switch {
+		case lmdb.IsNotFound(err):
+			k, _, err = cur.Get(nil, nil, lmdb.Last)
+		case err == nil && !bytes.Equal(k, seek):
+			k, _, err = cur.Get(nil, nil, lmdb.Prev)
+		}
+		if lmdb.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if len(k) == 33 && k[0] == schema.PrefBaseAccount && k[1] == p {
+			copy(h[:], k[1:])
+			ok = true
+		}
+		return nil
+	})
+	return
+}
+
+// MissingCodeHashes scans the 0x07 baseline accounts and returns the unique
+// referenced code hashes that have no 0x06 row yet (loader code sweep).
+// One long read txn; run it only while the writer is quiet.
+func (d *DB) MissingCodeHashes() ([]schema.Hash, error) {
+	emptyCode := Keccak(nil)
+	seen := make(map[schema.Hash]struct{})
+	var missing []schema.Hash
+	err := d.env.View(func(txn *lmdb.Txn) error {
+		txn.RawRead = true
+		cur, err := txn.OpenCursor(d.dbi)
+		if err != nil {
+			return err
+		}
+		defer cur.Close()
+		k, v, err := cur.Get([]byte{schema.PrefBaseAccount}, nil, lmdb.SetRange)
+		for ; err == nil; k, v, err = cur.Get(nil, nil, lmdb.Next) {
+			if len(k) != 33 || k[0] != schema.PrefBaseAccount {
+				break
+			}
+			a, derr := schema.DecodeAccount(v)
+			if derr != nil {
+				return derr
+			}
+			ch := a.CodeHash
+			if ch == (schema.Hash{}) || ch == emptyCode {
+				continue
+			}
+			if _, dup := seen[ch]; dup {
+				continue
+			}
+			seen[ch] = struct{}{}
+			if _, gerr := txn.Get(d.dbi, schema.AppendCodeKey(nil, ch)); gerr == nil {
+				continue
+			} else if !lmdb.IsNotFound(gerr) {
+				return gerr
+			}
+			missing = append(missing, ch)
+		}
+		if err != nil && !lmdb.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+	return missing, err
+}
+
 // GetDiff returns the 0x04 per-block diff (the capture batch verbatim).
 // Returns ErrNotFound when the block has no diff row.
 func (d *DB) GetDiff(block uint64) (b *capture.Batch, err error) {

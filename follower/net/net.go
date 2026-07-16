@@ -224,6 +224,12 @@ func (n *Network) RegisterRequest(id ids.NodeID)  { n.tracker.RegisterRequest(id
 func (n *Network) RegisterFailure(id ids.NodeID)  { n.tracker.RegisterFailure(id) }
 func (n *Network) RegisterResponse(id ids.NodeID) { n.tracker.RegisterResponse(id, 1) }
 
+// RegisterResponseBW records a response with a measured bandwidth so the
+// tracker can rank peers (state-sync leaf downloads).
+func (n *Network) RegisterResponseBW(id ids.NodeID, bandwidth float64) {
+	n.tracker.RegisterResponse(id, bandwidth)
+}
+
 func (n *Network) send(msg *message.OutboundMessage, nodeIDs set.Set[ids.NodeID]) {
 	n.net.Send(msg, avacommon.SendConfig{NodeIDs: nodeIDs}, avaconstants.PrimaryNetworkID, subnets.NoOpAllower)
 }
@@ -241,6 +247,18 @@ func (n *Network) SendGet(nodeID ids.NodeID, requestID uint32, containerID ids.I
 // SendGetAncestors requests a container and its ancestors (newest first).
 func (n *Network) SendGetAncestors(nodeID ids.NodeID, requestID uint32, containerID ids.ID) error {
 	msg, err := n.creator.GetAncestors(n.chainID, requestID, RequestTimeout, containerID, 0)
+	if err != nil {
+		return err
+	}
+	n.send(msg, set.Of(nodeID))
+	return nil
+}
+
+// SendAppRequest sends a chain-scoped application request (C-chain state
+// sync leaf/code exchange). Legacy coreth sync handlers only accept EVEN
+// request IDs (odd IDs route to the peer's SDK network); callers must comply.
+func (n *Network) SendAppRequest(nodeID ids.NodeID, requestID uint32, appBytes []byte) error {
+	msg, err := n.creator.AppRequest(n.chainID, requestID, RequestTimeout, appBytes)
 	if err != nil {
 		return err
 	}
