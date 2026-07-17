@@ -55,6 +55,10 @@ import (
 // imported AVAX correctly.
 const MainnetAVAXAssetID = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDGCgxN5Z"
 
+// MainnetCChainID feeds the warp precompile's source chain ID; a wrong value
+// would emit warp logs with a wrong payload and break the receipts check.
+const MainnetCChainID = "2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5"
+
 // headerHistory is how many finalized headers stay resident for the
 // BLOCKHASH 256-block window (with slack).
 const headerHistory = 300
@@ -108,10 +112,23 @@ func New(db *store.DB) (*Exec, error) {
 	if err != nil {
 		return nil, err
 	}
+	cChainID, err := ids.FromString(MainnetCChainID)
+	if err != nil {
+		return nil, err
+	}
+	snowCtx := &snow.Context{
+		NetworkID:   avaconstants.MainnetID,
+		ChainID:     cChainID,
+		AVAXAssetID: avaxAssetID,
+	}
+	// The warp precompile reads the snow context out of the chain config
+	// extras (sendWarpMessage panics on nil, and the emitted message embeds
+	// NetworkID and ChainID).
+	configExtra.AvalancheContext = cextras.AvalancheContext{SnowCtx: snowCtx}
 	return &Exec{
 		db:       db,
 		chainCfg: g.Config,
-		snowCtx:  &snow.Context{AVAXAssetID: avaxAssetID},
+		snowCtx:  snowCtx,
 		pending:  make(map[schema.Hash]*layer),
 		headers:  make(map[common.Hash]*ethtypes.Header),
 	}, nil
