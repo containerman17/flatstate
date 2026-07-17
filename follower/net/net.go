@@ -325,14 +325,13 @@ func reconcileValidators(m validators.Manager, weights map[ids.NodeID]uint64) er
 	return nil
 }
 
-// trackPeers fetches peer IPs for the validator set and ManuallyTracks them.
-func (n *Network) trackPeers(ctx context.Context, c *info.Client, validatorIDs []ids.NodeID) (int, error) {
-	peers, err := c.Peers(ctx, validatorIDs)
-	if err != nil || len(peers) == 0 {
-		peers, err = c.Peers(ctx, nil)
-		if err != nil {
-			return 0, fmt.Errorf("info.peers: %w", err)
-		}
+// trackPeers fetches ALL peer IPs the bootstrap node knows (validators and
+// non-validators alike; every C-chain node serves sync leaves) and
+// ManuallyTracks them.
+func (n *Network) trackPeers(ctx context.Context, c *info.Client, _ []ids.NodeID) (int, error) {
+	peers, err := c.Peers(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("info.peers: %w", err)
 	}
 	for _, p := range peers {
 		addr := p.PublicIP

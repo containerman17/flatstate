@@ -63,6 +63,8 @@ func run() error {
 		inflight   = flag.Int("inflight", 1536, "global cap on outstanding leaf/code requests")
 		perPeer    = flag.Int("per-peer", 6, "outstanding request cap per peer")
 		identities = flag.Int("identities", 1, "p2p identities to dial (peers throttle per node ID)")
+		splitWays  = flag.Int("split-ways", 16, "parallel sub-ranges per giant storage trie (changing it on a resumed store requires -no-storage-resume)")
+		noResume   = flag.Bool("no-storage-resume", false, "ignore storage sub-range watermarks (refetch in-progress tries; needed once after changing -split-ways)")
 		height     = flag.Uint64("height", 0, "pivot height S (0 = latest summary boundary)")
 	)
 	flag.Parse()
@@ -107,6 +109,7 @@ func run() error {
 	log.Info("pivot block", "height", s, "hash", hash, "root", root)
 
 	fnet.RegisterExtras() // account RLP carries the coreth multicoin extra
+	fsync.SetSplitWays(*splitWays, *noResume)
 
 	// Peers throttle inbound work PER NODE ID with a slow refill; one
 	// identity decays to the aggregate refill rate within minutes. Dialing

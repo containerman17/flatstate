@@ -74,6 +74,11 @@ const storageConcurrency = 6
 var (
 	splitAfter = 32
 	splitWays  = 16
+	// noStorageResume disables MaxBaseSlot watermarks for storage walks.
+	// REQUIRED for one run after changing splitAfter/splitWays on a store
+	// with partially-fetched giants: old sub-range boundaries no longer
+	// match, so watermarks would leave holes. Rewrites are idempotent.
+	noStorageResume = false
 )
 
 type bundle struct {
@@ -440,7 +445,7 @@ func (s *syncer) enqueue(ctx context.Context, b bundle) error {
 // rows below the watermark are complete. The sequential warmup cannot use
 // this (an earlier run's fan-out leaves holes across, never within, ranges).
 func (s *syncer) walkStorage(ctx context.Context, seg int, addrHash schema.Hash, root common.Hash, start, end []byte, maxReqs int) ([]byte, error) {
-	if maxReqs == 0 {
+	if maxReqs == 0 && !noStorageResume {
 		if wm, ok, err := s.cfg.DB.MaxBaseSlot(addrHash, start, end); err != nil {
 			return nil, err
 		} else if ok {
@@ -603,4 +608,13 @@ func incKey(key []byte) []byte {
 		}
 	}
 	return nil
+}
+
+// SetSplitWays overrides the giant-trie fan-out width. Changing it on a
+// store with partially-fetched giants requires noResume=true for one run.
+func SetSplitWays(ways int, noResume bool) {
+	if ways > 0 {
+		splitWays = ways
+	}
+	noStorageResume = noResume
 }
