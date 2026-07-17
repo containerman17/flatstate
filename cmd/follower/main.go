@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -272,6 +273,43 @@ func run() error {
 		}()
 	} else {
 		log.Warn("no ws_urls configured: mempool arrivals are NOT being captured")
+	}
+
+	// --- status + watchdog (own goroutine: the main loop can sit inside
+	// Tick for minutes during backfill execution, and LastAccepted takes
+	// the engine lock; the store watermark is lock-free truth) ---
+	if db != nil && !*dryRun {
+		go func() {
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+			var last uint64
+			stall := time.Now()
+			dumped := false
+			for range t.C {
+				f, ok, err := db.Finalized()
+				if err != nil || !ok {
+					continue
+				}
+				log.Info("watermark", "finalized", f, "peers", network.NumConnected())
+				if f != last {
+					last, stall, dumped = f, time.Now(), false
+					continue
+				}
+				since := time.Since(stall)
+				if since > 10*time.Minute {
+					log.Error("watchdog: finalized stalled, aborting", "for", since.Round(time.Second).String())
+					buf := make([]byte, 1<<22)
+					os.Stderr.Write(buf[:runtime.Stack(buf, true)])
+					os.Exit(2)
+				}
+				if since > 2*time.Minute && !dumped {
+					dumped = true
+					log.Warn("watchdog: finalized not advancing, dumping stacks", "for", since.Round(time.Second).String())
+					buf := make([]byte, 1<<22)
+					os.Stderr.Write(buf[:runtime.Stack(buf, true)])
+				}
+			}
+		}()
 	}
 
 	// --- main loop ---
