@@ -73,10 +73,15 @@ type Exec struct {
 	snowCtx  *snow.Context
 
 	mu        sync.Mutex
-	pending   map[schema.Hash]*layer           // executed, above finalized, by eth hash
-	headers   map[common.Hash]*ethtypes.Header // parent chain for BLOCKHASH + upgrade timestamps
-	dryBase   *layer                           // dry-run only: folded accepted diffs (store is read-only)
+	pending   map[schema.Hash]*layer // executed, above finalized, by eth hash
+	dryBase   *layer                 // dry-run only: folded accepted diffs (store is read-only)
 	finalized uint64
+
+	// headers has its own lock: chainCtx.GetHeader is called back from
+	// INSIDE the EVM (BLOCKHASH) while Execute holds mu; sharing mu was a
+	// self-deadlock on the first BLOCKHASH-using transaction.
+	hmu     sync.RWMutex
+	headers map[common.Hash]*ethtypes.Header // parent chain for BLOCKHASH + upgrade timestamps
 }
 
 // New builds an executor over the store (the store must have its baseline /
@@ -137,8 +142,8 @@ func New(db *store.DB) (*Exec, error) {
 // SeedHeaders installs ancestor headers (the resume block and >=256 below
 // it) so BLOCKHASH and upgrade-timestamp lookups work from the first block.
 func (e *Exec) SeedHeaders(headers []*ethtypes.Header) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.hmu.Lock()
+	defer e.hmu.Unlock()
 	for _, h := range headers {
 		e.headers[h.Hash()] = h
 	}
@@ -175,11 +180,13 @@ func (e *Exec) prune(height uint64) {
 	}
 	if height > headerHistory {
 		cut := height - headerHistory
+		e.hmu.Lock()
 		for h, hdr := range e.headers {
 			if hdr.Number.Uint64() < cut {
 				delete(e.headers, h)
 			}
 		}
+		e.hmu.Unlock()
 	}
 }
 
@@ -209,8 +216,8 @@ type chainCtx struct{ e *Exec }
 func (c chainCtx) Engine() consensus.Engine { return dummy.NewFullFaker() }
 
 func (c chainCtx) GetHeader(hash common.Hash, number uint64) *ethtypes.Header {
-	c.e.mu.Lock()
-	defer c.e.mu.Unlock()
+	c.e.hmu.RLock()
+	defer c.e.hmu.RUnlock()
 	h, ok := c.e.headers[hash]
 	if !ok || h.Number.Uint64() != number {
 		return nil
@@ -252,7 +259,9 @@ func (e *Exec) Execute(parent schema.Hash, blk *ethtypes.Block) (*capture.Batch,
 		Ops:    ops,
 	}
 	e.pending[batch.Hash] = newLayer(batch)
+	e.hmu.Lock()
 	e.headers[blk.Hash()] = header
+	e.hmu.Unlock()
 	return batch, nil
 }
 
@@ -260,7 +269,9 @@ func (e *Exec) Execute(parent schema.Hash, blk *ethtypes.Block) (*capture.Batch,
 func (e *Exec) run(parent schema.Hash, blk *ethtypes.Block) ([]capture.Op, uint64, ethtypes.Receipts, error) {
 	header := blk.Header()
 	num := blk.NumberU64()
+	e.hmu.RLock()
 	parentHeader, ok := e.headers[common.Hash(parent)]
+	e.hmu.RUnlock()
 	if !ok {
 		return nil, 0, nil, fmt.Errorf("exec: parent header %x of block %d not seeded", parent[:4], num)
 	}
