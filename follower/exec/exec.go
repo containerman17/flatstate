@@ -29,10 +29,14 @@ import (
 	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	"github.com/ava-labs/avalanchego/graft/coreth/core/extstate"
 	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
+	cextras "github.com/ava-labs/avalanchego/graft/coreth/params/extras"
 	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/atomic"
 	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
+	warpcontract "github.com/ava-labs/avalanchego/graft/coreth/precompile/contracts/warp"
+	_ "github.com/ava-labs/avalanchego/graft/coreth/precompile/registry"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
+	"github.com/ava-labs/avalanchego/upgrade"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/state"
@@ -79,6 +83,23 @@ func New(db *store.DB) (*Exec, error) {
 	var g corethcore.Genesis
 	if err := json.Unmarshal([]byte(cfg.CChainGenesis), &g); err != nil {
 		return nil, fmt.Errorf("exec: unmarshal C-chain genesis: %w", err)
+	}
+	// The genesis JSON carries no post-genesis upgrade schedule; the VM
+	// injects it from the avalanchego runtime config before aligning the
+	// eth upgrades (coreth parseGenesis). Without this, Durango/Etna never
+	// activate, so Shanghai/Cancun stay off and PUSH0 is an invalid opcode:
+	// every modern contract call burns its full gas limit.
+	configExtra := cparams.GetExtra(g.Config)
+	configExtra.NetworkUpgrades = cextras.GetNetworkUpgrades(upgrade.GetConfig(avaconstants.MainnetID))
+	// Mirror parseGenesis: the Warp precompile activates at Durango; a tx
+	// calling it would otherwise no-op into an empty address and diverge.
+	if configExtra.DurangoBlockTimestamp != nil {
+		configExtra.PrecompileUpgrades = append(configExtra.PrecompileUpgrades, cextras.PrecompileUpgrade{
+			Config: warpcontract.NewDefaultConfig(configExtra.DurangoBlockTimestamp),
+		})
+	}
+	if err := configExtra.Verify(); err != nil {
+		return nil, fmt.Errorf("exec: invalid chain config: %w", err)
 	}
 	if err := cparams.SetEthUpgrades(g.Config); err != nil {
 		return nil, fmt.Errorf("exec: set eth upgrades: %w", err)
