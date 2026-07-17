@@ -18,7 +18,7 @@ import (
 )
 
 // DefaultMapSize is a fat sparse map (D4); pages are only allocated as written.
-const DefaultMapSize = 200 << 30
+const DefaultMapSize = 250 << 30
 
 // Fail-loud errors per D13.
 var (
