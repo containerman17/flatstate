@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"sort"
 	gosync "sync"
 	"testing"
@@ -52,6 +53,12 @@ func (f *fakeClient) GetLeafs(_ context.Context, req message.LeafsRequest) (mess
 		seg := req.StartKey()[0]
 		f.mainStarts[seg] = append(f.mainStarts[seg], bytes.Clone(req.StartKey()))
 	}
+	// Regression guard: VerifyRangeProof cannot verify an EMPTY bounded
+	// response, so the loader must never send an End key (coreth
+	// sync/leaf/syncer.go does the same and truncates locally).
+	if len(req.EndKey()) > 0 {
+		return message.LeafsResponse{}, errors.New("fake: bounded LeafsRequest; empty tails would retry forever")
+	}
 	limit := int(req.KeyLimit())
 	if f.maxLeafs > 0 && f.maxLeafs < limit {
 		limit = f.maxLeafs
@@ -61,9 +68,6 @@ func (f *fakeClient) GetLeafs(_ context.Context, req message.LeafsRequest) (mess
 	for i, e := range list {
 		if len(req.StartKey()) > 0 && bytes.Compare(e.k, req.StartKey()) < 0 {
 			continue
-		}
-		if len(req.EndKey()) > 0 && bytes.Compare(e.k, req.EndKey()) > 0 {
-			break
 		}
 		if len(resp.Keys) >= limit {
 			break

@@ -311,8 +311,12 @@ func (s *syncer) runSegment(ctx context.Context, seg int, start []byte) error {
 		start[0] = byte(seg)
 	}
 	for {
+		// End is intentionally nil: VerifyRangeProof cannot verify an EMPTY
+		// bounded response, so a request for a range's empty tail retries
+		// forever (see coreth sync/leaf/syncer.go). Ask open-ended and
+		// truncate locally at segEnd instead.
 		req, err := message.NewLeafsRequest(message.CorethLeafsRequestType,
-			s.cfg.Root, common.Hash{}, start, segEnd, leafLimit, message.StateTrieNode)
+			s.cfg.Root, common.Hash{}, start, nil, leafLimit, message.StateTrieNode)
 		if err != nil {
 			return err
 		}
@@ -320,6 +324,7 @@ func (s *syncer) runSegment(ctx context.Context, seg int, start []byte) error {
 		if err != nil {
 			return fmt.Errorf("sync: segment %02x leafs at %x: %w", seg, start, err)
 		}
+		done := truncateAt(&resp, segEnd)
 		// Storage tries are fetched concurrently (they dominate the request
 		// count); slot bundles stream as they arrive, which is safe in any
 		// order. Only the account rows must commit ascending per segment
@@ -343,14 +348,13 @@ func (s *syncer) runSegment(ctx context.Context, seg int, start []byte) error {
 				return err
 			}
 		}
-		if len(resp.Keys) == 0 || !resp.More {
+		if done || !resp.More {
 			break
 		}
-		last := resp.Keys[len(resp.Keys)-1]
-		if bytes.Compare(last, segEnd) >= 0 {
-			break
+		if len(resp.Keys) == 0 {
+			return fmt.Errorf("sync: segment %02x: empty response with more=true", seg)
 		}
-		start = incKey(last)
+		start = incKey(resp.Keys[len(resp.Keys)-1])
 		if start == nil {
 			break
 		}
@@ -451,8 +455,10 @@ func (s *syncer) walkStorage(ctx context.Context, seg int, addrHash schema.Hash,
 		if maxReqs > 0 && n >= maxReqs {
 			return start, nil
 		}
+		// End nil for the same reason as the account walk: empty bounded
+		// responses cannot be range-proof-verified. Truncate locally.
 		req, err := message.NewLeafsRequest(message.CorethLeafsRequestType,
-			root, common.Hash(addrHash), start, end, leafLimit, message.StateTrieNode)
+			root, common.Hash(addrHash), start, nil, leafLimit, message.StateTrieNode)
 		if err != nil {
 			return nil, err
 		}
@@ -460,6 +466,7 @@ func (s *syncer) walkStorage(ctx context.Context, seg int, addrHash schema.Hash,
 		if err != nil {
 			return nil, fmt.Errorf("sync: storage of %x: %w", addrHash, err)
 		}
+		done := truncateAt(&resp, end)
 		slots := make([][2]schema.Hash, 0, len(resp.Keys))
 		for i := range resp.Keys {
 			if len(resp.Keys[i]) != 32 {
@@ -484,18 +491,36 @@ func (s *syncer) walkStorage(ctx context.Context, seg int, addrHash schema.Hash,
 		}}); err != nil {
 			return nil, err
 		}
-		if len(resp.Keys) == 0 || !resp.More {
+		if done || !resp.More {
 			return nil, nil
 		}
-		last := resp.Keys[len(resp.Keys)-1]
-		if len(end) > 0 && bytes.Compare(last, end) >= 0 {
-			return nil, nil
+		if len(resp.Keys) == 0 {
+			return nil, fmt.Errorf("sync: storage of %x: empty response with more=true", addrHash)
 		}
-		start = incKey(last)
+		start = incKey(resp.Keys[len(resp.Keys)-1])
 		if start == nil {
 			return nil, nil
 		}
 	}
+}
+
+// truncateAt drops response keys past end (nil end = no bound) and reports
+// whether anything was dropped, which means the walk covered its range.
+func truncateAt(resp *message.LeafsResponse, end []byte) bool {
+	if len(end) == 0 || len(resp.Keys) == 0 {
+		return false
+	}
+	i := len(resp.Keys) - 1
+	done := false
+	for ; i >= 0; i-- {
+		if bytes.Compare(resp.Keys[i], end) <= 0 {
+			break
+		}
+		done = true
+	}
+	resp.Keys = resp.Keys[:i+1]
+	resp.Vals = resp.Vals[:i+1]
+	return done
 }
 
 // splitRange divides [from, ff..ff] into n contiguous inclusive sub-ranges.
