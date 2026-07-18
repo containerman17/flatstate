@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -237,6 +238,8 @@ func main() {
 		dur     = flag.Duration("dur", 8*time.Second, "duration of each measured phase")
 		workers = flag.Int("workers", runtime.NumCPU(), "parallel submitter goroutines")
 		batch   = flag.Int("batch", 10, "calls per batch in the parallel phase")
+		cpuprof = flag.String("cpuprofile", "", "profile a sustained all-cores v3_quote run for -dur, write CPU profile here, then exit")
+		memprof = flag.String("memprofile", "", "with -cpuprofile: also write a heap/alloc profile here after the run")
 	)
 	flag.Parse()
 	if *dbPath == "" || *busPath == "" {
@@ -310,6 +313,38 @@ func main() {
 		v3Out, rQ.GasUsed, retWord(rQ, 3))
 	if v2Out.IsZero() || v3Out.IsZero() {
 		log.Fatal("zero quote from a live pool: state is wrong")
+	}
+
+	// --- profile-only mode: sustained all-cores QuoterV2 load ---
+	if *cpuprof != "" {
+		warm := make([]any, runtime.NumCPU()*2)
+		for i := range warm {
+			warm[i] = quoteCall(oneAvax)
+		}
+		eng.Execute(warm)
+		f, err := os.Create(*cpuprof)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal(err)
+		}
+		rate := runParallel(eng, quoteCall(oneAvax), *workers, *batch, *dur)
+		pprof.StopCPUProfile()
+		f.Close()
+		log.Printf("v3_quote profiled: %.0f calls/s over %v, CPU profile %s", rate, *dur, *cpuprof)
+		if *memprof != "" {
+			mf, err := os.Create(*memprof)
+			if err != nil {
+				log.Fatal(err)
+			}
+			runtime.GC()
+			if err := pprof.WriteHeapProfile(mf); err != nil {
+				log.Fatal(err)
+			}
+			mf.Close()
+		}
+		return
 	}
 
 	// --- benchmarks ---
