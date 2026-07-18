@@ -75,7 +75,7 @@ Selfdestruct: a destruct marker row per (address, block). Slot reads at height B
 0x02 | addr(20) | slot(32) | ^block(8)   -> slot value post-image (32B; tombstone for delete)
 0x03 | addr(20)            | ^block(8)   -> destruct marker
 0x04 | block(8)                          -> per-block diff (encoded key/value list, the capture batch verbatim)
-0x05 | seq(8)                            -> mempool arrival log entry (tx bytes + arrival timestamp)
+0x05 | reserved (mempool moved out of scope, external JSONL capture)
 0x06 | code hash(32)                     -> contract code (deduped)
 0x07 | keccak(addr)(32)                  -> baseline account at S (hash-keyed, see below)
 0x08 | keccak(addr)(32) | keccak(slot)(32) -> baseline slot at S (hash-keyed, see below)
@@ -115,11 +115,11 @@ Staleness: every batch is stamped with the preferred-tip hash at RLock time; res
 
 ### D10. Process topology: one follower, N equal readers
 
-- **Follower process** (the only writer): the D2 rev 2 follower (p2p + snowman sampling + coreth-as-library execution) + capture + external mempool WS client + main LMDB env writer + ephemeral tip env publisher.
-- **Bot processes** (any number, all equal): open main env read-only for state, poll the ephemeral env for tip diffs, preference resets, and mempool arrivals. Polling = reading a `seq` counter key (~100ns mmap read); sleep-polling gives ~0.5-1ms tip latency, busy-poll on a pinned goroutine gives 10-100 microseconds. Publish cost: one NOSYNC txn per event (~5 microseconds for a mempool tx, ~50-100 microseconds for a block diff), paid once regardless of reader count.
+- **Follower process** (the only writer): the D2 rev 2 follower (p2p + snowman sampling + coreth-as-library execution) + capture + main LMDB env writer + ephemeral tip env publisher.
+- **Bot processes** (any number, all equal): open main env read-only for state, poll the ephemeral env for tip diffs and preference resets. Polling = reading a `seq` counter key (~100ns mmap read); sleep-polling gives ~0.5-1ms tip latency, busy-poll on a pinned goroutine gives 10-100 microseconds. Publish cost: one NOSYNC txn per event (~50-100 microseconds for a block diff), paid once regardless of reader count.
 - **Test/replay processes**: main env read-only; they do not need the tip env.
 
-Reasoning: bots redeploy dozens of times a day during development; the follower must never restart with them because mempool history is irrecoverable. LMDB has no watch/subscribe; polling a counter at this cost is simpler than a socket protocol and was chosen over one deliberately. There is NO HTTP/RPC state serving anywhere: readers treat LMDB as a shared read-only memory segment. Calibration: mempool propagation jitter over p2p is tens of ms; a ~100 microsecond bus is noise.
+Reasoning: bots redeploy dozens of times a day during development; the follower must not restart with them. LMDB has no watch/subscribe; polling a counter at this cost is simpler than a socket protocol and was chosen over one deliberately. There is NO HTTP/RPC state serving anywhere: readers treat LMDB as a shared read-only memory segment.
 
 ### D11. Test-suite snapshot cache
 
@@ -127,7 +127,7 @@ Per (suite, block): one flat file (fixed-size records, optionally zstd). Load in
 
 ### D12. Replay is live minus the network
 
-A replay session = seed a mutable session map lazily (LMDB greatest-at-or-before-B seeks), then advance block by block applying 0x04 diff rows, interleaved with the 0x05 mempool log by timestamp. Same apply code as live, same miss path, every block "finalized". A replay process tailing a live writer sees each block as it commits (LMDB MVCC), so replay-on-live-data needs nothing special.
+A replay session = seed a mutable session map lazily (LMDB greatest-at-or-before-B seeks), then advance block by block applying 0x04 diff rows. Same apply code as live, same miss path, every block "finalized". A replay process tailing a live writer sees each block as it commits (LMDB MVCC), so replay-on-live-data needs nothing special.
 
 ### D13. Fail loud, never guess
 
@@ -149,6 +149,7 @@ Below history genesis S: error. Baseline not yet complete for a key: error. Dest
 - No sync.Map (write churn promotes dirty maps; plain maps under the batch-phase discipline win).
 - No custom replay protocol, no HTTP, no gRPC.
 - No merkle anything in this layer.
+- Mempool capture: out of scope, external JSONL files.
 
 ## Performance calibration (for sanity checks)
 

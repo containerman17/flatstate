@@ -1,8 +1,7 @@
 // Package replay re-runs history block by block (DESIGN.md D12): a session
 // seeds a mutable map lazily from store reads at height B, then advances by
-// applying 0x04 diff rows interleaved with the 0x05 mempool log by
-// timestamp. Same apply code and miss path as live (mem.Map). A session
-// tailing a live writer sees each block as it commits (LMDB MVCC).
+// applying 0x04 diff rows. Same apply code and miss path as live (mem.Map).
+// A session tailing a live writer sees each block as it commits (LMDB MVCC).
 package replay
 
 import (
@@ -14,27 +13,14 @@ import (
 	"github.com/containerman17/flatstate/store"
 )
 
-// Event is the next replay item: exactly one field is set. A Block event
-// means the diff was already applied and the session now sits at that
-// height; a Tx event is a mempool arrival to simulate against the current
-// state.
-type Event struct {
-	Block *capture.Batch
-	Tx    []byte
-	Time  uint64 // arrival time for Tx, unix ms
-}
-
 // Session is single-threaded.
 type Session struct {
-	db      *store.DB
-	m       *mem.Map
-	block   uint64 // state reflects end of this block
-	nextSeq uint64
+	db    *store.DB
+	m     *mem.Map
+	block uint64 // state reflects end of this block
 }
 
-// Open starts a session at startBlock (>= S). Mempool events are delivered
-// starting from the first arrival at or after startBlock's timestamp (or
-// from the beginning when startBlock has no diff row, e.g. startBlock == S).
+// Open starts a session at startBlock (>= S).
 func Open(db *store.DB, startBlock uint64) (*Session, error) {
 	s, ok, err := db.Genesis()
 	if err != nil {
@@ -46,50 +32,25 @@ func Open(db *store.DB, startBlock uint64) (*Session, error) {
 	if startBlock < s {
 		return nil, store.ErrBelowGenesis
 	}
-	sess := &Session{db: db, m: mem.NewMap(), block: startBlock}
-	var startTime uint64
-	if d, err := db.GetDiff(startBlock); err == nil {
-		startTime = d.Time
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-	seq, ok, err := db.FirstMempoolAt(startTime)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
-		sess.nextSeq = seq
-	}
-	// When no entry exists yet, start from seq 0 and let Next discover new
-	// appends while tailing a live writer.
-	return sess, nil
+	return &Session{db: db, m: mem.NewMap(), block: startBlock}, nil
 }
 
 // Block returns the session's current height.
 func (s *Session) Block() uint64 { return s.block }
 
-// Next advances the session: it returns the earlier of the next mempool
-// arrival and the next block diff (block wins timestamp ties). Returns
-// (nil, nil) when caught up with the store.
-func (s *Session) Next() (*Event, error) {
+// Next applies the next block diff and returns it; the session then sits at
+// that height. Returns (nil, nil) when caught up with the store.
+func (s *Session) Next() (*capture.Batch, error) {
 	diff, err := s.db.GetDiff(s.block + 1)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil // caught up
 	}
-	t, tx, haveTx, err := s.db.GetMempool(s.nextSeq)
 	if err != nil {
 		return nil, err
 	}
-	if haveTx && (diff == nil || t < diff.Time) {
-		s.nextSeq++
-		return &Event{Tx: tx, Time: t}, nil
-	}
-	if diff == nil {
-		return nil, nil // caught up
-	}
 	s.m.Apply(diff)
 	s.block = diff.Block
-	return &Event{Block: diff}, nil
+	return diff, nil
 }
 
 // Account reads through the session map, pinning from the store at the

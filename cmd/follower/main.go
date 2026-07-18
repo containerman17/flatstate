@@ -1,7 +1,7 @@
 // Command follower is the flatstate writer process (DESIGN.md D10): the
 // D2 rev 2 custom C-chain follower (p2p + snowman sampling + coreth-as-
-// library execution) + capture + external mempool WS client + main LMDB
-// writer + ephemeral tip env publisher.
+// library execution) + capture + main LMDB writer + ephemeral tip env
+// publisher.
 //
 // --dry-run connects, follows, executes, and validates but writes nothing:
 // with a baseline store it opens it read-only and folds accepted diffs in
@@ -27,7 +27,6 @@ import (
 	"github.com/containerman17/flatstate/capture"
 	"github.com/containerman17/flatstate/follower/consensus"
 	"github.com/containerman17/flatstate/follower/exec"
-	"github.com/containerman17/flatstate/follower/mempoolws"
 	"github.com/containerman17/flatstate/follower/net"
 	"github.com/containerman17/flatstate/mem"
 	"github.com/containerman17/flatstate/node"
@@ -51,7 +50,6 @@ func (d *duration) UnmarshalJSON(b []byte) error {
 type fileConfig struct {
 	NodeURI          string   `json:"node_uri"`          // bootstrap RPC, default https://api.avax.network
 	BootstrapPeers   []string `json:"bootstrap_peers"`   // optional extra "NodeID-...@ip:port"
-	WSURLs           []string `json:"ws_urls"`           // mempool WebSocket endpoints
 	DBPath           string   `json:"db_path"`           // main LMDB env
 	TipbusPath       string   `json:"tipbus_path"`       // ephemeral tip env
 	MapSizeGB        int64    `json:"map_size_gb"`       // main env map size, default 200
@@ -168,10 +166,6 @@ func run() error {
 	}
 
 	// --- sinks ---
-	type mempoolSink interface {
-		Mempool(tx []byte, time uint64) error
-	}
-	sinkReady := make(chan mempoolSink, 1) // real mode: the node sink's tracker feeds mempool too
 	var makeSink func(uint64, schema.Hash) (consensus.Sink, error)
 	if *dryRun {
 		makeSink = func(h uint64, hash schema.Hash) (consensus.Sink, error) {
@@ -190,12 +184,7 @@ func run() error {
 		}
 		nodeSink := node.NewSink(db, st, bus)
 		makeSink = func(h uint64, hash schema.Hash) (consensus.Sink, error) {
-			tracker := node.NewTracker(nodeSink, h, hash)
-			select {
-			case sinkReady <- tracker:
-			default:
-			}
-			return &liveSink{tracker: tracker, ex: ex}, nil
+			return &liveSink{tracker: node.NewTracker(nodeSink, h, hash), ex: ex}, nil
 		}
 	}
 
@@ -246,34 +235,6 @@ func run() error {
 		return err
 	}
 	engine.Store(eng)
-
-	// --- mempool (real mode: after the tracker exists; dry-run: counter) ---
-	mempoolErr := make(chan error, 1)
-	if len(cfg.WSURLs) > 0 {
-		go func() {
-			var sink func(tx []byte, t uint64) error
-			if *dryRun {
-				var n atomic.Uint64
-				sink = func(tx []byte, t uint64) error {
-					if c := n.Add(1); c%1000 == 0 {
-						log.Info("dry-run mempool arrivals", "count", c)
-					}
-					return nil
-				}
-			} else {
-				var tracker mempoolSink
-				select {
-				case tracker = <-sinkReady:
-				case <-ctx.Done():
-					return
-				}
-				sink = func(tx []byte, t uint64) error { return tracker.Mempool(tx, t) }
-			}
-			mempoolErr <- mempoolws.Run(ctx, mempoolws.Config{URLs: cfg.WSURLs, Sink: sink, Log: log})
-		}()
-	} else {
-		log.Warn("no ws_urls configured: mempool arrivals are NOT being captured")
-	}
 
 	// --- status + watchdog (own goroutine: the main loop can sit inside
 	// Tick for minutes during backfill execution, and LastAccepted takes
@@ -327,11 +288,6 @@ func run() error {
 			return fmt.Errorf("capture halted: %w", err)
 		case err := <-network.DispatchDone():
 			return fmt.Errorf("network dispatch stopped: %w", err)
-		case err := <-mempoolErr:
-			if ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("mempool: %w", err)
 		case <-tick.C:
 			eng.Tick()
 		case <-status.C:

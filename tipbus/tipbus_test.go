@@ -35,9 +35,6 @@ func TestPublishPollHandshake(t *testing.T) {
 	if err := w.PublishBlock(batch(101)); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.PublishMempool(555, []byte("tx")); err != nil {
-		t.Fatal(err)
-	}
 	if err := w.PublishBlock(batch(102)); err != nil {
 		t.Fatal(err)
 	}
@@ -50,26 +47,23 @@ func TestPublishPollHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fin != 101 || len(layers) != 1 || layers[0].Block != 102 || seq != 4 {
+	if fin != 101 || len(layers) != 1 || layers[0].Block != 102 || seq != 3 {
 		t.Fatalf("handshake = fin %d, %d layers, seq %d", fin, len(layers), seq)
 	}
 
 	// Full poll from the start sees every event in order.
 	events, next, err := r.Poll(0)
-	if err != nil || next != 4 || len(events) != 4 {
+	if err != nil || next != 3 || len(events) != 3 {
 		t.Fatalf("poll: %d events, next %d, %v", len(events), next, err)
 	}
 	if events[0].Kind != EvBlock || events[0].Batch.Block != 101 {
 		t.Fatalf("event 0: %+v", events[0])
 	}
-	if events[1].Kind != EvMempool || events[1].Time != 555 || string(events[1].Tx) != "tx" {
+	if events[1].Kind != EvBlock || events[1].Batch.Block != 102 {
 		t.Fatalf("event 1: %+v", events[1])
 	}
-	if events[2].Kind != EvBlock || events[2].Batch.Block != 102 {
+	if events[2].Kind != EvFinalize || events[2].Height != 101 || events[2].Hash != h(101) {
 		t.Fatalf("event 2: %+v", events[2])
-	}
-	if events[3].Kind != EvFinalize || events[3].Height != 101 || events[3].Hash != h(101) {
-		t.Fatalf("event 3: %+v", events[3])
 	}
 
 	// Incremental poll from the handshake point.
@@ -77,7 +71,7 @@ func TestPublishPollHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	events, next, err = r.Poll(next)
-	if err != nil || len(events) != 1 || next != 5 {
+	if err != nil || len(events) != 1 || next != 4 {
 		t.Fatalf("incremental poll: %d events, next %d, %v", len(events), next, err)
 	}
 	if events[0].Kind != EvReset || len(events[0].Batches) != 2 || events[0].Batches[1].Block != 103 {
@@ -129,21 +123,6 @@ func TestWriterTruncatesOnOpen(t *testing.T) {
 	}
 	if fin != 0 || len(layers) != 0 || seq != 0 {
 		t.Fatalf("bus not truncated: fin %d, %d layers, seq %d", fin, len(layers), seq)
-	}
-}
-
-func BenchmarkPublishMempool(b *testing.B) {
-	w, err := OpenWriter(b.TempDir(), 1<<30)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer w.Close()
-	tx := make([]byte, 200)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := w.PublishMempool(uint64(i), tx); err != nil {
-			b.Fatal(err)
-		}
 	}
 }
 

@@ -82,14 +82,6 @@ func (s *Sink) PreferenceReset(preferred []*capture.Batch) error {
 	return s.bus.PublishReset(preferred)
 }
 
-// Mempool records one arrival durably (D4) and publishes it to the bus.
-func (s *Sink) Mempool(tx []byte, time uint64) error {
-	if _, err := s.db.AppendMempool(time, tx); err != nil {
-		return err
-	}
-	return s.bus.PublishMempool(time, tx)
-}
-
 // WriteFinal is the bootstrap/backfill path: blocks executed during
 // bootstrap are final on arrival and no reader is attached yet, so they skip
 // mem and the bus entirely. Idempotent, same as WriteBlock (D7).

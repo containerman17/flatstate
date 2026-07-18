@@ -1,6 +1,6 @@
 // Package tipbus is the ephemeral LMDB environment (DESIGN.md D7, D10):
-// unfinalized block diffs, preference resets, and mempool arrivals published
-// by the node, poll-consumed by any number of reader processes. NOSYNC, and
+// unfinalized block diffs and preference resets published by the node,
+// poll-consumed by any number of reader processes. NOSYNC, and
 // truncated whenever the writer opens it, so a restart can never resume on a
 // fork by construction.
 package tipbus
@@ -31,7 +31,6 @@ const (
 	EvBlock    EventKind = 1 // new unfinalized block on the preferred chain
 	EvFinalize EventKind = 2 // block accepted
 	EvReset    EventKind = 3 // preference reset: full new unfinalized stack
-	EvMempool  EventKind = 4 // mempool arrival
 )
 
 // Event is one published entry. Only the fields for its Kind are set.
@@ -41,8 +40,6 @@ type Event struct {
 	Batches []*capture.Batch // EvReset, oldest first
 	Height  uint64           // EvFinalize
 	Hash    schema.Hash      // EvFinalize
-	Time    uint64           // EvMempool, unix ms
-	Tx      []byte           // EvMempool
 }
 
 const defaultMapSize = 8 << 30
@@ -137,16 +134,14 @@ func (b *Bus) writeState(txn *lmdb.Txn) error {
 	return txn.Put(b.dbi, keyState, v, 0)
 }
 
-func (b *Bus) publish(payload []byte, updateState bool) error {
+func (b *Bus) publish(payload []byte) error {
 	return b.env.Update(func(txn *lmdb.Txn) error {
 		key := append([]byte{prefEvent}, binary.BigEndian.AppendUint64(nil, b.seq)...)
 		if err := txn.Put(b.dbi, key, payload, 0); err != nil {
 			return err
 		}
-		if updateState {
-			if err := b.writeState(txn); err != nil {
-				return err
-			}
+		if err := b.writeState(txn); err != nil {
+			return err
 		}
 		b.seq++
 		return txn.Put(b.dbi, keySeq, binary.BigEndian.AppendUint64(nil, b.seq), 0)
@@ -156,7 +151,7 @@ func (b *Bus) publish(payload []byte, updateState bool) error {
 // PublishBlock publishes a new unfinalized block diff.
 func (b *Bus) PublishBlock(batch *capture.Batch) error {
 	b.layers = append(b.layers, batch)
-	return b.publish(batch.Encode([]byte{byte(EvBlock)}), true)
+	return b.publish(batch.Encode([]byte{byte(EvBlock)}))
 }
 
 // PublishFinalize marks the oldest unfinalized block accepted.
@@ -167,7 +162,7 @@ func (b *Bus) PublishFinalize(height uint64, hash schema.Hash) error {
 	b.layers = b.layers[1:]
 	b.finalized = height
 	p := binary.BigEndian.AppendUint64([]byte{byte(EvFinalize)}, height)
-	return b.publish(append(p, hash[:]...), true)
+	return b.publish(append(p, hash[:]...))
 }
 
 // PublishReset replaces the unfinalized stack (preference reset), oldest first.
@@ -179,13 +174,7 @@ func (b *Bus) PublishReset(preferred []*capture.Batch) error {
 		p = binary.BigEndian.AppendUint32(p, uint32(len(enc)))
 		p = append(p, enc...)
 	}
-	return b.publish(p, true)
-}
-
-// PublishMempool publishes a mempool arrival (unix ms).
-func (b *Bus) PublishMempool(t uint64, tx []byte) error {
-	p := binary.BigEndian.AppendUint64([]byte{byte(EvMempool)}, t)
-	return b.publish(append(p, tx...), false)
+	return b.publish(p)
 }
 
 // --- subscriber ---
@@ -322,12 +311,6 @@ func decodeEvent(v []byte) (Event, error) {
 			ev.Batches = append(ev.Batches, b)
 			body = body[4+l:]
 		}
-	case EvMempool:
-		if len(body) < 8 {
-			return Event{}, errors.New("tipbus: bad mempool event")
-		}
-		ev.Time = binary.BigEndian.Uint64(body[:8])
-		ev.Tx = append([]byte(nil), body[8:]...)
 	default:
 		return Event{}, fmt.Errorf("tipbus: unknown event kind %d", ev.Kind)
 	}

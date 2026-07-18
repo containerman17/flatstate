@@ -17,8 +17,8 @@ const (
 	PrefSlot     byte = 0x02 // 0x02 | addr(20) | slot(32) | ^block(8) -> slot value post-image
 	PrefDestruct byte = 0x03 // 0x03 | addr(20) | ^block(8) -> destruct marker (empty value)
 	PrefDiff     byte = 0x04 // 0x04 | block(8) -> per-block diff (capture batch verbatim)
-	PrefMempool  byte = 0x05 // 0x05 | seq(8) -> arrival time(8) + tx bytes
-	PrefCode     byte = 0x06 // 0x06 | code hash(32) -> contract code
+	// 0x05 reserved (mempool moved out of scope, external JSONL capture)
+	PrefCode byte = 0x06 // 0x06 | code hash(32) -> contract code
 	// Hash-keyed snapshot baseline at S (D6 rev 2). Probed once per cold key
 	// after a preimage-history miss; one keccak, off the steady-state path.
 	PrefBaseAccount byte = 0x07 // 0x07 | keccak(addr)(32) -> account post-image at S
@@ -44,7 +44,6 @@ const (
 	SlotKeyLen        = 1 + 20 + 32 + 8
 	DestructKeyLen    = 1 + 20 + 8
 	DiffKeyLen        = 1 + 8
-	MempoolKeyLen     = 1 + 8
 	CodeKeyLen        = 1 + 32
 	BaseAccountKeyLen = 1 + 32
 	BaseSlotKeyLen    = 1 + 32 + 32
@@ -127,11 +126,6 @@ func AppendDestructKey(dst []byte, addr Address, block uint64) []byte {
 func AppendDiffKey(dst []byte, block uint64) []byte {
 	dst = append(dst, PrefDiff)
 	return binary.BigEndian.AppendUint64(dst, block)
-}
-
-func AppendMempoolKey(dst []byte, seq uint64) []byte {
-	dst = append(dst, PrefMempool)
-	return binary.BigEndian.AppendUint64(dst, seq)
 }
 
 func AppendCodeKey(dst []byte, hash Hash) []byte {

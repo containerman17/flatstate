@@ -9,8 +9,8 @@ import (
 )
 
 // Tracker translates the embedded node's raw events (block verified, head
-// moved, block accepted, mempool arrival) into capture.Sink calls. Coreth
-// executes blocks at Verify time for every processing block, preferred or
+// moved, block accepted) into capture.Sink calls. Coreth executes blocks
+// at Verify time for every processing block, preferred or
 // not; the preferred chain is only known from head events. Tracker keeps the
 // verified-but-unfinalized batches in a side table and derives the published
 // stack by walking parent hashes from the head down to the finalized block.
@@ -137,11 +137,4 @@ func (t *Tracker) Accepted(block uint64, hash schema.Hash) error {
 		}
 	}
 	return nil
-}
-
-// Mempool records one arrival (unix ms, stamped by the glue at receipt).
-func (t *Tracker) Mempool(tx []byte, time uint64) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.sink.Mempool(tx, time)
 }

@@ -57,7 +57,6 @@ func TestKeyLens(t *testing.T) {
 		{AppendSlotKey(nil, addr, slot, 1), SlotKeyLen},
 		{AppendDestructKey(nil, addr, 1), DestructKeyLen},
 		{AppendDiffKey(nil, 1), DiffKeyLen},
-		{AppendMempoolKey(nil, 1), MempoolKeyLen},
 		{AppendCodeKey(nil, slot), CodeKeyLen},
 	} {
 		if len(tc.key) != tc.want {

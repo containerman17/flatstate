@@ -119,21 +119,6 @@ func TestSinkFinalizeUnknownBlock(t *testing.T) {
 	}
 }
 
-func TestSinkMempool(t *testing.T) {
-	r := newRig(t)
-	if err := r.sink.Mempool([]byte{1, 2, 3}, 42); err != nil {
-		t.Fatal(err)
-	}
-	tm, tx, ok, err := r.db.GetMempool(0)
-	if err != nil || !ok || tm != 42 || len(tx) != 3 {
-		t.Fatalf("mempool row = %d %x %v %v", tm, tx, ok, err)
-	}
-	evs, _, err := r.bus.Poll(0)
-	if err != nil || len(evs) != 1 || evs[0].Kind != tipbus.EvMempool || evs[0].Time != 42 {
-		t.Fatalf("bus events = %+v, %v", evs, err)
-	}
-}
-
 func TestWriteFinal(t *testing.T) {
 	r := newRig(t)
 	b := batch(101, h(0xA1), h(0), slotOp(addrA, s1, h(0x11)))

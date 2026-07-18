@@ -254,43 +254,6 @@ func TestNoGenesis(t *testing.T) {
 	}
 }
 
-func TestMempoolLog(t *testing.T) {
-	dir := t.TempDir()
-	d, err := Open(dir, testMapSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, tx := range []string{"tx0", "tx1", "tx2"} {
-		seq, err := d.AppendMempool(uint64(1000*(i+1)), []byte(tx))
-		if err != nil || seq != uint64(i) {
-			t.Fatalf("append %d: seq=%d err=%v", i, seq, err)
-		}
-	}
-	tm, tx, ok, err := d.GetMempool(1)
-	if err != nil || !ok || tm != 2000 || string(tx) != "tx1" {
-		t.Fatalf("GetMempool(1) = %d %q %v %v", tm, tx, ok, err)
-	}
-	if _, _, ok, _ := d.GetMempool(3); ok {
-		t.Fatal("seq 3 should not exist")
-	}
-	if seq, ok, _ := d.FirstMempoolAt(1500); !ok || seq != 1 {
-		t.Fatalf("FirstMempoolAt(1500) = %d %v", seq, ok)
-	}
-	if _, ok, _ := d.FirstMempoolAt(9999); ok {
-		t.Fatal("FirstMempoolAt past end should miss")
-	}
-	// Seq counter survives reopen (dense log).
-	d.Close()
-	d, err = Open(dir, testMapSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d.Close()
-	if seq, err := d.AppendMempool(4000, []byte("tx3")); err != nil || seq != 3 {
-		t.Fatalf("after reopen: seq=%d err=%v", seq, err)
-	}
-}
-
 func BenchmarkGetSlot(b *testing.B) {
 	d, err := Open(b.TempDir(), testMapSize)
 	if err != nil {

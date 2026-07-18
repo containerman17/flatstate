@@ -46,7 +46,7 @@ type Batch struct {
 	Block  uint64
 	Hash   schema.Hash
 	Parent schema.Hash
-	Time   uint64 // block timestamp, unix milliseconds; orders 0x05 mempool interleave (D12)
+	Time   uint64 // block timestamp, unix milliseconds
 	Ops    []Op
 }
 
@@ -197,8 +197,6 @@ type Sink interface {
 	// PreferenceReset replaces all unfinalized blocks with the new preferred
 	// chain above the finalized height, oldest first.
 	PreferenceReset(preferred []*Batch) error
-	// Mempool records a transaction arrival (unix ms).
-	Mempool(tx []byte, time uint64) error
 }
 
 // Source is implemented by the embedded-node phase; it exists only for that

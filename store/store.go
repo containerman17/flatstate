@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"sync/atomic"
 
 	"github.com/PowerDNS/lmdb-go/lmdb"
@@ -36,9 +35,6 @@ type DB struct {
 	dbi lmdb.DBI
 	ro  bool
 
-	mempoolMu sync.Mutex // guards nextSeq; keeps 0x05 seq dense
-	nextSeq   uint64
-
 	genesisPlus1 atomic.Uint64 // cached MetaGenesis+1; 0 = not yet observed
 	baselineDone atomic.Bool   // cached MetaBaselineComplete; monotonic
 }
@@ -52,26 +48,7 @@ func Open(path string, mapSize int64) (*DB, error) {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return nil, err
 	}
-	d, err := open(path, mapSize, 0)
-	if err != nil {
-		return nil, err
-	}
-	// Initialize the mempool seq counter from the last 0x05 row.
-	err = d.env.View(func(txn *lmdb.Txn) error {
-		last, ok, err := lastMempoolSeq(txn, d.dbi)
-		if err != nil {
-			return err
-		}
-		if ok {
-			d.nextSeq = last + 1
-		}
-		return nil
-	})
-	if err != nil {
-		d.env.Close()
-		return nil, err
-	}
-	return d, nil
+	return open(path, mapSize, 0)
 }
 
 // OpenReadOnly opens an existing environment for reading (second processes).
@@ -434,103 +411,6 @@ func (bl *Baseline) Finish() error {
 	}
 	bl.d.baselineDone.Store(true)
 	return nil
-}
-
-// --- mempool log (0x05) ---
-
-// AppendMempool durably appends one arrival (irrecoverable data, D4).
-// t is unix milliseconds. Seq numbers are dense.
-func (d *DB) AppendMempool(t uint64, tx []byte) (seq uint64, err error) {
-	d.mempoolMu.Lock()
-	defer d.mempoolMu.Unlock()
-	seq = d.nextSeq
-	val := make([]byte, 8+len(tx))
-	copy(val, beBytes(t))
-	copy(val[8:], tx)
-	err = d.env.Update(func(txn *lmdb.Txn) error {
-		return txn.Put(d.dbi, schema.AppendMempoolKey(nil, seq), val, 0)
-	})
-	if err == nil {
-		d.nextSeq++
-	}
-	return seq, err
-}
-
-// GetMempool reads one arrival by seq. ok=false past the end of the log.
-func (d *DB) GetMempool(seq uint64) (t uint64, tx []byte, ok bool, err error) {
-	err = d.env.View(func(txn *lmdb.Txn) error {
-		txn.RawRead = true
-		v, err := txn.Get(d.dbi, schema.AppendMempoolKey(nil, seq))
-		if lmdb.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if len(v) < 8 {
-			return fmt.Errorf("store: mempool entry %d truncated", seq)
-		}
-		t = beU64(v[:8])
-		tx = bytes.Clone(v[8:])
-		ok = true
-		return nil
-	})
-	return
-}
-
-// FirstMempoolAt returns the seq of the first arrival with time >= t
-// (linear cursor scan; used once to position a replay session).
-// ok=false when no such entry exists.
-func (d *DB) FirstMempoolAt(t uint64) (seq uint64, ok bool, err error) {
-	err = d.env.View(func(txn *lmdb.Txn) error {
-		txn.RawRead = true
-		cur, err := txn.OpenCursor(d.dbi)
-		if err != nil {
-			return err
-		}
-		defer cur.Close()
-		k, v, err := cur.Get([]byte{schema.PrefMempool}, nil, lmdb.SetRange)
-		for ; err == nil; k, v, err = cur.Get(nil, nil, lmdb.Next) {
-			if len(k) != schema.MempoolKeyLen || k[0] != schema.PrefMempool {
-				break
-			}
-			if len(v) >= 8 && beU64(v[:8]) >= t {
-				seq = beU64(k[1:])
-				ok = true
-				return nil
-			}
-		}
-		if err != nil && !lmdb.IsNotFound(err) {
-			return err
-		}
-		return nil
-	})
-	return
-}
-
-func lastMempoolSeq(txn *lmdb.Txn, dbi lmdb.DBI) (uint64, bool, error) {
-	cur, err := txn.OpenCursor(dbi)
-	if err != nil {
-		return 0, false, err
-	}
-	defer cur.Close()
-	// Position at the first key after the 0x05 range, then step back.
-	k, _, err := cur.Get([]byte{schema.PrefMempool + 1}, nil, lmdb.SetRange)
-	if lmdb.IsNotFound(err) {
-		k, _, err = cur.Get(nil, nil, lmdb.Last)
-	} else if err == nil {
-		k, _, err = cur.Get(nil, nil, lmdb.Prev)
-	}
-	if lmdb.IsNotFound(err) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	if len(k) != schema.MempoolKeyLen || k[0] != schema.PrefMempool {
-		return 0, false, nil
-	}
-	return beU64(k[1:]), true, nil
 }
 
 func beBytes(v uint64) []byte { return binary.BigEndian.AppendUint64(nil, v) }
