@@ -15,8 +15,8 @@ Stock avalanchego/geth state access is built for validation, not simulation:
 
 Three workloads:
 
-1. **Tip simulation** (latency-critical): simulate candidate and mempool transactions against the preferred tip with overlay/overwrite semantics.
-2. **Replay**: re-run history block by block (plus recorded mempool arrivals) as fast as the loop turns.
+1. **Tip simulation** (latency-critical): simulate candidate transactions (and externally captured pending txs) against the preferred tip with overlay/overwrite semantics.
+2. **Replay**: re-run history block by block as fast as the loop turns (pending-tx interleave, if wanted, comes from external JSONL capture at the consumer layer).
 3. **Correctness tests**: a fixed list of 10-20 blocks tortured repeatedly, ~70k calls per block, heavy key overlap.
 
 ## Decisions
@@ -33,7 +33,6 @@ Rev 1 embedded the full avalanchego node as a library. Superseded: the capture h
 - **Validator set**: fetched and periodically refreshed from public P-chain RPC (`platform.getCurrentValidators` on api.avax.network); peer IPs via `info.peers`. The P-chain VM is never run.
 - **Finality**: real snowman sampling against that weighted validator set (PullQuery/Chits polling). Gossip (`Put`) provides the preferred tip; our own polls decide acceptance. Decided over a depth/quorum heuristic: finality is verified locally, not trusted.
 - **Execution**: coreth's state transition as a library (`NewEVMBlockContext` + `ApplyTransaction`, deforestationdb `executor/` precedent) against OUR statedb. No Firewood, no trie, no full node, no fork, no replace directives.
-- **Mempool**: NOT from our p2p. A plain WebSocket client subscribed to external nodes (`newPendingTransactions`); arrivals are timestamped at receipt.
 
 Validation trade (recorded honestly): rev 1 got state-root checking free from Firewood. Without a trie we cannot compute state roots. Per-block validation is now: snowman acceptance (network-verified finality) + computed receiptsRoot, gasUsed, logsBloom compared against the header, fail loud on mismatch. Silent state divergence with matching receipts is theoretically possible and accepted; a periodic cross-check of sampled accounts against a public archival RPC is the cheap watchdog if wanted.
 
@@ -48,7 +47,6 @@ One LMDB environment (via `github.com/PowerDNS/lmdb-go`) holds:
 - full state snapshot baseline at height S (the state-sync pivot; see D6),
 - post-image history rows for every key changed since S,
 - per-block diff lists,
-- mempool arrival log (irrecoverable data; capture it durably).
 
 Why LMDB: single writer + N concurrent cross-process readers over a shared mmap, MVCC, readers lock-free and always see the latest committed txn, no compaction, no background threads, B+tree cursor `SetRange` implements our seek pattern natively. With tens of GB against 300 GB RAM the whole tree lives in page cache.
 
@@ -90,7 +88,7 @@ Reasoning for 0x04: replay must advance a session view block by block in O(diff)
 
 ### D7. Finalized-only persistence; unfinalized is ephemeral
 
-The main LMDB env only ever contains data from ACCEPTED blocks. Unfinalized (processing/preferred) block diffs and mempool arrivals are published to a SEPARATE ephemeral LMDB env that is truncated at follower boot. Consequence: a restart can never resume on a fork, by construction; there is no poisoned-row detection problem because poison never persists.
+The main LMDB env only ever contains data from ACCEPTED blocks. Unfinalized (processing/preferred) block diffs are published to a SEPARATE ephemeral LMDB env that is truncated at follower boot. Consequence: a restart can never resume on a fork, by construction; there is no poisoned-row detection problem because poison never persists.
 
 Write ordering per accepted block: (1) main-env LMDB write txn commits, (2) in-memory base override, (3) finalized-height watermark bump. A concurrent reader miss during apply therefore cannot pin a stale value: LMDB runs ahead of the base map, never behind. Bootstrap replay after a crash rewrites identical rows (idempotent), same invariant as PR 5624 ("history durable before state commit").
 
