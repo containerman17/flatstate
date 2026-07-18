@@ -149,6 +149,26 @@ Below history genesis S: error. Baseline not yet complete for a key: error. Dest
 - No merkle anything in this layer.
 - Mempool capture: out of scope, external JSONL files.
 
+### D16. Simulation executor (sim package; shape and measured numbers)
+
+The engine-pluggable executor is a custom `vm.StateDB` over the engine View, driving libevm's interpreter directly (`evm.Call`, below ApplyMessage). Shape, per D14:
+
+- Per-call thin journaled overlay: hot maps for storage and balance overrides; nonce/code/destruct/transient/access-list maps exist for CREATE-capable sims and normally stay empty. Reset with `clear()`, never reallocated; Snapshot/Revert = journal truncation, O(mutations).
+- Per-executor EVM + BlockContext + Rules rebuilt only when the tip hash moves (each executor owns its copy; no shared global). Block env comes from the tip batch (number, timestamp); Random/Difficulty mimic coreth's Shanghai hook.
+- JUMPDEST analysis shared across calls through a persistent root `vm.Contract` (per-from caller contracts inherit its jumpdests map). keccak(code) is never recomputed: EXTCODEHASH reads the account row's codehash; only CREATE hashes new code, once.
+- Reads: overlay -> View (unfinalized layers -> base map -> LMDB pin via SideBuffer). View read errors cannot cross the vm.StateDB interface; they cancel the EVM and surface as Result.Err (D13).
+- STORAGE KEYS ARE NORMALIZED. The entire store is keyed by coreth's multicoin-normalized slot preimages (`key[0] &^= 0x01`, extstate): capture runs through the extstate wrap and the baseline is hashed from normalized keys. sim normalizes on every persistent storage access. Found live: UniV3 `factory.getPool` silently read zero before this.
+- PROCESS ISOLATION IS MANDATORY: coreth's vm hooks (`corethcore.RegisterExtras`) type-assert the concrete `*state.StateDB` in `OverrideNewEVMArgs` and panic on any custom statedb, so sim can never share a process with follower/exec. sim registers only `cparams.RegisterExtras`. The D10 topology already separates follower and bots; this makes the separation load-bearing.
+- Known deviations (accepted, tip-simulation scope): BLOCKHASH returns the zero hash, GasUsed excludes intrinsic gas, GASLIMIT is a fixed constant, pre-AP1 GetCommittedState quirks not reproduced.
+
+Measured on the live box (i7-10700K, 8c/16t, live tip applying ~1 block/s, cmd/simbench as a second read-only process, 2026-07-18):
+
+- USDC balanceOf (proxy + delegatecall, 9.7k gas): p50 30us / p99 50us; 37k calls/s single thread, 432k/s all cores.
+- Joe V2 pair getReserves: p50 17us; router getAmountOut: p50 14us, 740k/s all cores.
+- UniV3 QuoterV2 real quote (101k gas, tick walking): p50 209us / p99 290us; 4.6k/s single thread, 34k/s all cores (~7.4x on 8 physical cores).
+- Batch phase transitions under live blocks: mean 540us, max 3.7ms per write event in the reader process; 634 stale-batch requeues over 64s of all-core hammering (discarded work only, correctness preserved).
+- Profile: state access is invisible (base-map probes below noise); the dominant fixed cost on tiny calls is the engine's goroutine-per-call spawn and stack growth (~10us/call). Acceptable while real quotes run 200us+; the upgrade path is persistent worker goroutines in the engine pool, not state-layer work.
+
 ## Performance calibration (for sanity checks)
 
 - One EVM call: ~400 microseconds interpreter floor (libevm); this dominates everything.

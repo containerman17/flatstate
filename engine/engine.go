@@ -7,6 +7,7 @@ package engine
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/holiman/uint256"
 
@@ -72,6 +73,10 @@ func (v *View) SetSlot(addr schema.Address, slot, val schema.Hash) {
 	v.slots[schema.SKey{Addr: addr, Slot: slot}] = val
 }
 
+// TipInfo returns the tip hash, block height, and timestamp (unix seconds)
+// the view is reading at. Valid only during the call (batch held).
+func (v *View) TipInfo() (schema.Hash, uint64, uint64) { return v.st.TipInfo() }
+
 // Account returns the shared account (nonce/codehash reads delegate here).
 func (v *View) Account(addr schema.Address) (schema.Account, bool, error) {
 	return v.st.Account(addr, v.sb)
@@ -88,8 +93,9 @@ type worker struct {
 
 // Engine fans batches of calls over a fixed executor pool.
 type Engine struct {
-	st   *mem.State
-	pool chan *worker
+	st       *mem.State
+	pool     chan *worker
+	requeues atomic.Uint64
 }
 
 // New builds an engine over st with the given executors (one pool slot
@@ -118,8 +124,13 @@ func (e *Engine) Execute(calls []any) []any {
 		if e.st.TipHash() == stamp {
 			return results
 		}
+		e.requeues.Add(1)
 	}
 }
+
+// Requeues returns how many whole batches were discarded as stale (tip moved
+// mid-batch) and rerun.
+func (e *Engine) Requeues() uint64 { return e.requeues.Load() }
 
 // run executes one attempt under a single read phase.
 func (e *Engine) run(calls []any) ([]any, schema.Hash) {

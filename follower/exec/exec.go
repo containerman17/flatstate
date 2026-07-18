@@ -19,25 +19,17 @@
 package exec
 
 import (
-	"encoding/json"
 	"fmt"
 	"sync"
 
-	"github.com/ava-labs/avalanchego/genesis"
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus/dummy"
 	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	"github.com/ava-labs/avalanchego/graft/coreth/core/extstate"
 	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
-	cextras "github.com/ava-labs/avalanchego/graft/coreth/params/extras"
 	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/atomic"
 	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
-	warpcontract "github.com/ava-labs/avalanchego/graft/coreth/precompile/contracts/warp"
-	_ "github.com/ava-labs/avalanchego/graft/coreth/precompile/registry"
-	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
-	"github.com/ava-labs/avalanchego/upgrade"
-	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/state"
 	ethtypes "github.com/ava-labs/libevm/core/types"
@@ -46,18 +38,11 @@ import (
 	"github.com/ava-labs/libevm/trie"
 
 	"github.com/containerman17/flatstate/capture"
+	"github.com/containerman17/flatstate/chaincfg"
 	"github.com/containerman17/flatstate/follower/net"
 	"github.com/containerman17/flatstate/schema"
 	"github.com/containerman17/flatstate/store"
 )
-
-// MainnetAVAXAssetID is required by the atomic-tx state transfer to credit
-// imported AVAX correctly.
-const MainnetAVAXAssetID = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDGCgxN5Z"
-
-// MainnetCChainID feeds the warp precompile's source chain ID; a wrong value
-// would emit warp logs with a wrong payload and break the receipts check.
-const MainnetCChainID = "2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5"
 
 // headerHistory is how many finalized headers stay resident for the
 // BLOCKHASH 256-block window (with slack).
@@ -88,51 +73,13 @@ type Exec struct {
 // history; reads of uncovered keys fail loud per D13).
 func New(db *store.DB) (*Exec, error) {
 	net.RegisterExtras()
-	cfg := genesis.GetConfig(avaconstants.MainnetID)
-	var g corethcore.Genesis
-	if err := json.Unmarshal([]byte(cfg.CChainGenesis), &g); err != nil {
-		return nil, fmt.Errorf("exec: unmarshal C-chain genesis: %w", err)
-	}
-	// The genesis JSON carries no post-genesis upgrade schedule; the VM
-	// injects it from the avalanchego runtime config before aligning the
-	// eth upgrades (coreth parseGenesis). Without this, Durango/Etna never
-	// activate, so Shanghai/Cancun stay off and PUSH0 is an invalid opcode:
-	// every modern contract call burns its full gas limit.
-	configExtra := cparams.GetExtra(g.Config)
-	configExtra.NetworkUpgrades = cextras.GetNetworkUpgrades(upgrade.GetConfig(avaconstants.MainnetID))
-	// Mirror parseGenesis: the Warp precompile activates at Durango; a tx
-	// calling it would otherwise no-op into an empty address and diverge.
-	if configExtra.DurangoBlockTimestamp != nil {
-		configExtra.PrecompileUpgrades = append(configExtra.PrecompileUpgrades, cextras.PrecompileUpgrade{
-			Config: warpcontract.NewDefaultConfig(configExtra.DurangoBlockTimestamp),
-		})
-	}
-	if err := configExtra.Verify(); err != nil {
-		return nil, fmt.Errorf("exec: invalid chain config: %w", err)
-	}
-	if err := cparams.SetEthUpgrades(g.Config); err != nil {
-		return nil, fmt.Errorf("exec: set eth upgrades: %w", err)
-	}
-	avaxAssetID, err := ids.FromString(MainnetAVAXAssetID)
+	cfg, snowCtx, err := chaincfg.Mainnet()
 	if err != nil {
 		return nil, err
 	}
-	cChainID, err := ids.FromString(MainnetCChainID)
-	if err != nil {
-		return nil, err
-	}
-	snowCtx := &snow.Context{
-		NetworkID:   avaconstants.MainnetID,
-		ChainID:     cChainID,
-		AVAXAssetID: avaxAssetID,
-	}
-	// The warp precompile reads the snow context out of the chain config
-	// extras (sendWarpMessage panics on nil, and the emitted message embeds
-	// NetworkID and ChainID).
-	configExtra.AvalancheContext = cextras.AvalancheContext{SnowCtx: snowCtx}
 	return &Exec{
 		db:       db,
-		chainCfg: g.Config,
+		chainCfg: cfg,
 		snowCtx:  snowCtx,
 		pending:  make(map[schema.Hash]*layer),
 		headers:  make(map[common.Hash]*ethtypes.Header),

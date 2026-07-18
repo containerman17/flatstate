@@ -15,6 +15,7 @@ package mem
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/holiman/uint256"
 
@@ -178,6 +179,10 @@ type State struct {
 	buffers   []*SideBuffer
 	finalized uint64
 	tip       schema.Hash // preferred tip hash (batch staleness stamp)
+	tipBlock  uint64      // height of the newest applied block (0 = none yet)
+	tipTime   uint64      // its timestamp, unix seconds
+
+	pinsMerged atomic.Uint64 // side-buffer entries merged into the base (D9)
 }
 
 type layer struct {
@@ -264,7 +269,19 @@ func (s *State) FinalizedHeight() uint64 {
 	return s.finalized
 }
 
+// PinsMerged returns the cumulative count of side-buffer entries merged into
+// the base map by write phases (accounts + slots + codes).
+func (s *State) PinsMerged() uint64 { return s.pinsMerged.Load() }
+
 // --- read phase (call only between BeginBatch/EndBatch) ---
+
+// TipInfo returns the tip hash, block height, and timestamp (unix seconds) of
+// the newest applied block. Read-phase only: the caller must hold a batch
+// (BeginBatch/EndBatch); it takes no lock itself. block == 0 means no block
+// event has been applied yet (the executor must refuse to simulate, D13).
+func (s *State) TipInfo() (schema.Hash, uint64, uint64) {
+	return s.tip, s.tipBlock, s.tipTime
+}
 
 // Account resolves an account through layers -> base -> side buffer -> LMDB.
 func (s *State) Account(addr schema.Address, sb *SideBuffer) (schema.Account, bool, error) {
@@ -356,7 +373,9 @@ func (s *State) Code(hash schema.Hash, sb *SideBuffer) ([]byte, error) {
 // can never overwrite a newer applied diff. Caller must Unlock.
 func (s *State) lockAndDrain() {
 	s.mu.Lock()
+	var merged uint64
 	for _, sb := range s.buffers {
+		merged += uint64(len(sb.accounts) + len(sb.slots) + len(sb.code))
 		for addr, e := range sb.accounts {
 			if e.exists {
 				s.base.PinAccount(addr, &e.acct, true)
@@ -376,6 +395,7 @@ func (s *State) lockAndDrain() {
 		clear(sb.slots)
 		clear(sb.code)
 	}
+	s.pinsMerged.Add(merged)
 }
 
 // ApplyBlock pushes a new unfinalized block layer and moves the tip stamp.
@@ -384,6 +404,8 @@ func (s *State) ApplyBlock(b *capture.Batch) {
 	defer s.mu.Unlock()
 	s.layers = append(s.layers, newLayer(b))
 	s.tip = b.Hash
+	s.tipBlock = b.Block
+	s.tipTime = b.Time / 1000
 }
 
 // Finalize applies the oldest unfinalized layer to the base (cached keys
@@ -416,5 +438,7 @@ func (s *State) PreferenceReset(preferred []*capture.Batch) {
 	for _, b := range preferred {
 		s.layers = append(s.layers, newLayer(b))
 		s.tip = b.Hash
+		s.tipBlock = b.Block
+		s.tipTime = b.Time / 1000
 	}
 }
